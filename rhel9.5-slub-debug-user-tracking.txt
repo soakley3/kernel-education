@@ -1,0 +1,444 @@
+
+
+
+14 February 2025
+Lucas Oakley (stlucas)
+
+
+
+
+RHEL 9.5 slub debug user tracking, and other some other details.
+How to use the U in slub_debug=FZPU.
+ 
+
+[INVESTIGATION]
+
+[I.1] This is the latest vmcore. 
+
+          KERNEL: /shared/kernel-debuginfo-files/5.14.0-503.21.1.el9_5.x86_64/usr/lib/debug/lib/modules/5.14.0-503.21.1.el9_5.x86_64/vmlinux
+        DUMPFILE: /cores/tasks/.../vmcore/vmcore  [PARTIAL DUMP]
+            CPUS: 28
+            DATE: ...
+          UPTIME: ...
+    LOAD AVERAGE: 20.71, 19.47, 20.21
+           TASKS: 5454
+        NODENAME: ...
+         RELEASE: 5.14.0-503.21.1.el9_5.x86_64
+         VERSION: #1 SMP PREEMPT_DYNAMIC Thu Dec 19 09:37:00 EST 2024
+         MACHINE: x86_64  (2693 Mhz)
+          MEMORY: 96 GB
+           PANIC: ""
+             PID: 1160274
+         COMMAND: "..."
+            TASK: ffff91744546a3c0  [THREAD_INFO: ffff91744546a3c0]
+             CPU: 8
+           STATE: TASK_RUNNING (PANIC)
+
+
+[I.2] The system was booted with slub_debug=FZPU on the kernel command line. 
+
+    crash> p saved_command_line 
+    saved_command_line = $1 = 0xffff9188bffb7440 "BOOT_IMAGE=(hd0,gpt2)/vmlinuz-5.14.0-503.21.1.el9_5.x86_64 root=/dev/mapper/... ro crashkernel=1G-4G:192M,4G-64G:256M,64G-:512M resume=/dev/mapper/... rd.lvm.lv=rhel_epic-trn-db1/root rd.lvm.lv=..."...
+
+    crash> rd -a 0xffff9188bffb7440
+    ffff9188bffb7440:  BOOT_IMAGE=(hd0,gpt2)/vmlinuz-5.14.0-503.21.1.el9_5.x86_64 r
+    ffff9188bffb747c:  oot=/dev/mapper/... ro crashkernel=1G-4
+    ffff9188bffb74b8:  G:192M,4G-64G:256M,64G-:512M resume=/dev/mapper/...--t
+    ffff9188bffb74f4:  ... rd.lvm.lv=.../root rd.lvm.lv=rhel
+    ffff9188bffb7530:  .../swap init_on_alloc=0 default_hugepagesz=2M hug
+    ffff9188bffb756c:  epagesz=2M hugepages=0 iommu.passthrough=1 slub_debug=FZPU p
+                                                                  ^^^^^^^^^^^^^^^ ^
+    ffff9188bffb75a8:  anic_on_taint=0x20 
+                       ^^^^^^^^^^^^^^^^^^
+
+[I.3] Using slub_debug with `FZPU` enables the following debugging facilities for all slab caches: 
+
+        [1] How to use slub_debug to troubleshoot and debug slab issues
+            https://access.redhat.com/solutions/5577011
+
+    F    Sanity checks checks basic details about slab objects, such as making sure the current amount 
+         of objects on a slab is not greater than the maximum amount of objects that slab can hold, or 
+         the current amount of used slab objects is not more than the amount of objects on the slab 
+         (and various other small checks).
+
+    Z    Red zoning adds a small amount of internal fragmentation to slabs known as "Redzones". These 
+         zones have an unlikely value (defined in include/linux/poison.h) written to them and these values 
+         are checked for consistency. Useful to detect times where part of a slab is overwritten.
+
+    P    Posioning writes an unlikely "poison" value to a slab object on allocation or freeing a slab 
+         object. On allocation, the slab object is "poisoned" with this value until the object is 
+         actually stored in the slab. On free, the object is overwritten with the poison value. 
+         Useful to detect "use-after-free" situations.
+
+    U    User tracking stores the PID and PID's kernel stack when that PID allocates or frees a slab 
+         object in an internal structure. Requires a vmcore to view.
+
+[I.4] The panic occurred in routine open_cached_dir_by_dentry(), similar to the first few vmcore dumps.  
+
+    crash> bt
+    PID: 1160274  TASK: ffff91744546a3c0  CPU: 8    COMMAND: "..."
+     #0 [ffffb4108734f5d0] machine_kexec at ffffffff8647a897
+     #1 [ffffb4108734f628] __crash_kexec at ffffffff865faeea
+     #2 [ffffb4108734f6e8] crash_kexec at ffffffff865fc018
+     #3 [ffffb4108734f6f0] oops_end at ffffffff86431dea
+     #4 [ffffb4108734f710] exc_general_protection at ffffffff870cf228
+     #5 [ffffb4108734f7b0] asm_exc_general_protection at ffffffff87200af2
+        [exception RIP: open_cached_dir_by_dentry+0x3d]
+        RIP: ffffffffc0c6835d  RSP: ffffb4108734f868  RFLAGS: 00010282
+        RAX: ffff9171b9631b88  RBX: 6b6b6b6b6b6b6b6b  RCX: 0000000000000038
+        RDX: 0000000000000001  RSI: ffff9171b18ff8c8  RDI: ffff9171b9631b80
+        RBP: ffff9171b18ff8c8   R8: 0000000000000001   R9: 0000000000000007
+        R10: ffff9171b18ff8c8  R11: d0868b968d9e93bc  R12: ffff9171b9631b80
+        R13: ffffb4108734f890  R14: d0d0d0d0d0d0d0d0  R15: 2f2f2f2f2f2f2f2f
+        ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+     #6 [ffffb4108734f888] cifs_dentry_needs_reval at ffffffffc0c56a43 [cifs]
+     #7 [ffffb4108734f8b8] cifs_revalidate_dentry_attr at ffffffffc0c5c34e [cifs]
+     #8 [ffffb4108734f900] cifs_revalidate_dentry at ffffffffc0c5c70f [cifs]
+     #9 [ffffb4108734f910] cifs_d_revalidate at ffffffffc0c43f97 [cifs]
+    #10 [ffffb4108734f938] lookup_fast at ffffffff868592ba
+    #11 [ffffb4108734f978] walk_component at ffffffff8685db51
+    #12 [ffffb4108734f9d0] link_path_walk at ffffffff8685df3e
+    #13 [ffffb4108734fa30] path_parentat at ffffffff8685e0fc
+    #14 [ffffb4108734fa58] __filename_parentat at ffffffff8685e238
+    #15 [ffffb4108734fb98] do_unlinkat at ffffffff86860798
+    #16 [ffffb4108734fc10] __x64_sys_unlink at ffffffff86860b4e
+    #17 [ffffb4108734fc20] do_syscall_64 at ffffffff870ce45c
+    #18 [ffffb4108734ff50] entry_SYSCALL_64_after_hwframe at ffffffff87200130
+        RIP: 00007fc5c5aff37b  RSP: 00007ffd86da25f8  RFLAGS: 00000206
+        RAX: ffffffffffffffda  RBX: 0000000000000003  RCX: 00007fc5c5aff37b
+        RDX: 0000000000c99290  RSI: 00007fc57da81802  RDI: 00007fc57e9fe010
+        RBP: 0000000000000003   R8: 0000000000000001   R9: 00007fc57e9fe010
+        R10: 00007fc57da2c018  R11: 0000000000000206  R12: 0000000000000030
+        R13: 0000000000000005  R14: ffffffffffffffff  R15: 0000000000000081
+        ORIG_RAX: 0000000000000057  CS: 0033  SS: 002b
+
+[I.5] This time, we panic referencing the invalid address placed in register RBX. This is attempting
+      to derive the dentry pointer from a cached_fid structure in RBX.
+
+    crash> dis -rl ffffffffc0c6835d
+    ...
+    /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/smb/client/cached_dir.c: 403
+    0xffffffffc0c68358 <open_cached_dir_by_dentry+0x38>:	test   %rbp,%rbp
+    0xffffffffc0c6835b <open_cached_dir_by_dentry+0x3b>:	je     0xffffffffc0c68366 <open_cached_dir_by_dentry+0x46>
+    0xffffffffc0c6835d <open_cached_dir_by_dentry+0x3d>:	cmp    %rbp,0x98(%rbx)
+
+        crash> struct cached_fid.dentry -o
+        struct cached_fid {
+           [0x98] struct dentry *dentry;
+        }
+
+    391 int open_cached_dir_by_dentry(struct cifs_tcon *tcon,
+    392                               struct dentry *dentry,
+    393                               struct cached_fid **ret_cfid)
+    394 {
+    395         struct cached_fid *cfid;
+    396         struct cached_fids *cfids = tcon->cfids;
+    397 
+    398         if (cfids == NULL)
+    399                 return -ENOENT;
+    400 
+    401         spin_lock(&cfids->cfid_list_lock);
+    402         list_for_each_entry(cfid, &cfids->entries, entry) {
+    403                 if (dentry && cfid->dentry == dentry) {
+                                      ^^^^^^^^^^^^                 <<<<< panic deriving cfid->dentry
+
+[I.6] This appears to be a poison value, intentionally placed as a result of using slub_debug.
+
+    RBX: 6b6b6b6b6b6b6b6b
+
+[I.7] This value ends up in RBX as a result of reading R12 at an offset of 0x8, deriving the entries list from the 
+      cached_fids structure in R12. 
+
+    crash> dis -rl ffffffffc0c6835d
+    ...
+    /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/smb/client/cached_dir.c: 402
+    0xffffffffc0c68349 <open_cached_dir_by_dentry+0x29>:	mov    0x8(%r12),%rbx
+
+        crash> struct cached_fids.entries -o
+        struct cached_fids {
+           [0x8] struct list_head entries;
+        }
+
+    0xffffffffc0c6834e <open_cached_dir_by_dentry+0x2e>:	lea    0x8(%r12),%rax
+    0xffffffffc0c68353 <open_cached_dir_by_dentry+0x33>:	cmp    %rax,%rbx
+    0xffffffffc0c68356 <open_cached_dir_by_dentry+0x36>:	je     0xffffffffc0c6836e <open_cached_dir_by_dentry+0x4e>
+
+[I.8] The address in R12 for the cached_fids structure shows it is an allocated slab object:
+
+        R12: ffff9171b9631b80
+
+    crash> kmem 0xffff9171b9631b80
+    CACHE             OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME
+    ffff917180048ac0      128       3046      3570     85    16k  kmalloc-128
+      SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE
+      ffffdff944e58c00  ffff9171b9630000     0     42         30    12
+      FREE / [ALLOCATED]
+      [ffff9171b9631b00]
+
+          PAGE         PHYSICAL      MAPPING       INDEX CNT FLAGS
+    ffffdff944e58c40  139631000                0        4  0 17ffffc0000000
+
+[I.9] The value on the entries list at offset 0x8 is 0xffff9173b7f87400. This doesn't match
+      what is in RBX, suggesting that a race has occurred.  
+
+    crash> struct cached_fids.entries ffff9171b9631b80
+      entries = {
+        next = 0xffff9173b7f87400,
+        prev = 0xffff9173b7f87400
+      },
+
+[I.10] Looking at this address, we see that it's a free'd slab object. It seems to be from the correct sized
+       generic slab cache kmalloc-512, since the structure is 368 bytes.
+
+    crash> struct cached_fid -d -o | grep SIZE
+    SIZE: 368
+
+    crash> kmem ffff9173b7f87400
+    CACHE             OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME
+    ffff917180048f40      512      12690     13419    639    32k  kmalloc-512
+      SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE
+      ffffdff94cdfe000  ffff9173b7f80000     0     21         20     1
+      FREE / [ALLOCATED]
+       ffff9173b7f87200  
+
+          PAGE         PHYSICAL      MAPPING       INDEX CNT FLAGS
+    ffffdff94cdfe1c0  337f87000 dead000000000400        0  0 17ffffc0000000
+
+[I.11] Let's annotate the free'd object. The kmem_cache structure provides information about the formatting of the objects. 
+
+    crash> struct kmem_cache.name,size,red_left_pad,inuse ffff917180048f40
+      name = 0xffffffff87a45362 "kmalloc-512",
+      size = 0x600,
+      red_left_pad = 0x200,
+      inuse = 0x208,
+
+[I.12] Annotating the object: 
+
+    crash> rd ffff9173b7f87200 0x180 -SS | head -n 100 
+    ffff9173b7f87200:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb    \
+    ffff9173b7f87210:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb     |
+    ffff9173b7f87220:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb     | 
+    ffff9173b7f87230:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb     |
+    ffff9173b7f87240:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb     | 0x200 of padding
+    ffff9173b7f87250:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb     | 
+    .. snip ..                                               |
+    ffff9173b7f873e0:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb     |
+    ffff9173b7f873f0:  bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb    /
+
+    ffff9173b7f87400:  6b6b6b6b6b6b6b6b 6b6b6b6b6b6b6b6b    \ 
+    ffff9173b7f87410:  6b6b6b6b6b6b6b6b 6b6b6b6b6b6b6b6b     | 
+    ffff9173b7f87420:  6b6b6b6b6b6b6b6b 6b6b6b6b6b6b6b6b     | 0x200 bytes of data cache area 
+    ffff9173b7f87430:  6b6b6b6b6b6b6b6b 6b6b6b6b6b6b6b6b     |
+    .. snip ..                                               |
+    ffff9173b7f875e0:  6b6b6b6b6b6b6b6b 6b6b6b6b6b6b6b6b     |
+    ffff9173b7f875f0:  6b6b6b6b6b6b6b6b a56b6b6b6b6b6b6b    /
+
+    ffff9173b7f87600:  bbbbbbbbbbbbbbbb                      | 0x8 bytes of extra padding. 
+                                        8e794fb529e140e3     | 0x8 bytes of extra pointer
+
+    ffff9173b7f87610:  find_or_create_cached_dir+0xc8 0000001102240103  \ struct track (0x20 bytes, object allocation tracking)  
+    ffff9173b7f87620:  000000000011b583 00000001016d9197                /
+
+    ffff9173b7f87630:  open_cached_dir+0x8b8 0000001102f40103           \ struct track (0x20 bytes, object free tracking) 
+    ffff9173b7f87640:  000000000011b583 00000001016d9198                /
+
+    ffff9173b7f87650:  5a5a5a5a00000170 5a5a5a5a5a5a5a5a    \
+    ffff9173b7f87660:  5a5a5a5a5a5a5a5a 5a5a5a5a5a5a5a5a     |
+    ffff9173b7f87670:  5a5a5a5a5a5a5a5a 5a5a5a5a5a5a5a5a     | remaining padding so the object is sized 0x600 bytes
+    ffff9173b7f87680:  5a5a5a5a5a5a5a5a 5a5a5a5a5a5a5a5a     |
+    .. snip ..                                               |
+    ffff9173b7f877e0:  5a5a5a5a5a5a5a5a 5a5a5a5a5a5a5a5a     |
+    ffff9173b7f877f0:  5a5a5a5a5a5a5a5a 5a5a5a5a5a5a5a5a    /
+
+    ffff9173b7f87800:  cccccccccccccccc cccccccccccccccc    \
+    ffff9173b7f87810:  cccccccccccccccc cccccccccccccccc     |  start of the next object
+    ffff9173b7f87820:  cccccccccccccccc cccccccccccccccc     |
+
+[I.13] The jiffies at the time of the jump: 
+
+    crash> pd jiffies
+    jiffies = $9 = 4318925208
+
+[I.14] The allocation of the object was 1 jiffy before the panic, by PID 1160579 on CPU 17.
+
+    Allocation:
+
+    crash> struct track ffff9173b7f87610
+    struct track {
+      addr = 0xffffffffc0c677d8,       | find_or_create_cached_dir+0xc8
+      handle = 0x2240103,              | 
+      cpu = 0x11,                      | decimal: 17
+      pid = 0x11b583,                  | decimal: 1160579
+      when = 0x1016d9197               | decimal: 4318925207 jiffies (1 jiffy ago) 
+    }
+
+[I.15] And the object was freed 0 jiffies, just at the time of the dump, by the same PID on the same CPU 17.
+
+    Free: 
+
+    crash> struct track ffff9173b7f87630
+    struct track {
+      addr = 0xffffffffc0c681d8,       | open_cached_dir+0x8b8
+      handle = 0x2f40103,              | 
+      cpu = 0x11,                      | decimal: 17
+      pid = 0x11b583,                  | decimal: 1160579
+      when = 0x1016d9198               | decimal: 4318925208 (0 jiffy ago) 
+    }
+
+[I.16] The task however has just now entered uninterruptible state, so we'll need to use the 
+       allocation and freeing track structures to see the exact allocation and free'ing code paths.
+
+    crash> ps -m 1160579
+    [0 00:00:00.000] [UN]  PID: 1160579  TASK: ffff9173098cc740  CPU: 17   COMMAND: "..."
+
+    crash> bt 1160579
+    PID: 1160579  TASK: ffff9173098cc740  CPU: 17   COMMAND: "..."
+     #0 [ffffb4109112b820] __schedule at ffffffff870de369
+     #1 [ffffb4109112b888] schedule at ffffffff870de6ce
+     #2 [ffffb4109112b8a0] wait_for_response at ffffffffc0c6340b [cifs]
+     #3 [ffffb4109112b8e8] compound_send_recv at ffffffffc0c65784 [cifs]
+     #4 [ffffb4109112ba28] smb2_query_dir_first at ffffffffc0c7da45 [cifs]
+     #5 [ffffb4109112bc28] _initiate_cifs_search at ffffffffc0c6bafa [cifs]
+     #6 [ffffb4109112bc90] cifs_readdir at ffffffffc0c6ce25 [cifs]
+     #7 [ffffb4109112bd30] iterate_dir at ffffffff86865029
+     #8 [ffffb4109112bd68] __x64_sys_getdents64 at ffffffff86865ea0
+     #9 [ffffb4109112bdc8] do_syscall_64 at ffffffff870ce45c
+    #10 [ffffb4109112bf50] entry_SYSCALL_64_after_hwframe at ffffffff87200130
+        RIP: 00007f1c6dcd4da7  RSP: 00007ffeff5485c8  RFLAGS: 00000293
+        RAX: ffffffffffffffda  RBX: 00007f1c6daff040  RCX: 00007f1c6dcd4da7
+        RDX: 0000000000100000  RSI: 00007f1c6daff040  RDI: 0000000000000003
+        RBP: 00007f1c6daff014   R8: 00007f1c6daff010   R9: 0000000000000000
+        R10: 0000000000000022  R11: 0000000000000293  R12: fffffffffffffea0
+        R13: 0000000000000000  R14: 00007f1c6daff010  R15: 0000000000000000
+        ORIG_RAX: 00000000000000d9  CS: 0033  SS: 002b
+
+[I.17] We can find the stack records by referencing the depot_stack_handle_t handles recorded in the 
+       annotated slab object in [I.12].  
+
+    crash> struct track.handle ffff9173b7f87610 -o 2 
+    struct track {
+      [ffff9173b7f87618] depot_stack_handle_t handle;          <<< allocation 
+    }
+
+    struct track {
+      [ffff9173b7f87638] depot_stack_handle_t handle;          <<< free 
+    }
+
+[I.18] Here are the allocation and freeing handle unique identifiers. 
+
+    crash> handle_parts ffff9173b7f87618
+    union handle_parts {
+      handle = 0x2240103,                                      <<< allocation handle 
+      {
+        pool_index = 0x103,
+        offset = 0x112,
+        extra = 0x0
+      }
+    }
+
+    crash> handle_parts ffff9173b7f87638
+    union handle_parts {
+      handle = 0x2f40103,                                      <<< free handle
+      {
+        pool_index = 0x103,
+        offset = 0x17a,
+        extra = 0x0
+      }
+    }
+
+[I.19] Both of the handle_part unions show the pool_index of where the stack records are 
+       stored is 0x103. Subtract one from the pool_index to get the correct stack_pool list.
+
+    crash> p stack_pools[0x102]
+    $2 = (void *) 0xffff917542834000                           << get the stack record pool address 
+
+[I.20] Finally, use the offset in the handle_parts to find the exact stack_record structure address
+       for each allocation and free stack_record.
+
+    crash> px (0xffff917542834000 + (0x112 << 4))
+    $7 = 0xffff917542835120                                    <<< allocation stack_record structure 
+
+    crash> px (0xffff917542834000 + (0x17a << 4)) 
+    $1 = 0xffff9175428357a0                                    <<< freeing stack_record structure 
+
+[I.21] Here is the allocation stack record. It's handle identifier matches the freed slab object. 
+
+    Allocation: 
+
+    crash> stack_record ffff917542835120
+    struct stack_record {
+      hash_list = {
+        next = 0xffff918858c7f6e0,
+        prev = 0xffff918858c7f6e0
+      },
+      hash = 0x1b087f6e,
+      size = 0x8,
+      handle = {
+        handle = 0x2240103,          <<<
+        {
+          pool_index = 0x103,
+          offset = 0x112,
+          extra = 0x0
+        }
+      },
+    ....
+      {
+        entries = {0xffffffff8677a525, 0xffffffffc0c677d8, 0xffffffffc0c67a73, 0xffffffffc0c6c8bf, 0xffffffff86865029, 0xffffffff86865ea0, 0xffffffff870ce45c, 0xffffffff87200130, 0xffff9188590f58c0, 0xffff9188590f58c0, .. snip ..},
+        {
+    ....
+      }
+    }
+
+[I.22] Here is the freeing stack record. It's handle identifier matches the freed slab object. 
+
+    Free: 
+
+    crash> stack_record 0xffff9175428357a0
+    struct stack_record {
+      hash_list = {
+        next = 0xffff918858484780,
+        prev = 0xffff9171f2a19420
+      },
+      hash = 0x34c08478,
+      size = 0x5,
+      handle = {
+        handle = 0x2f40103,          <<< 
+        {
+          pool_index = 0x103,
+          offset = 0x17a,
+          extra = 0x0
+        }
+      },
+    ....
+      {
+        entries = {0xffffffffc0c6c8bf, 0xffffffff86865029, 0xffffffff86865ea0, 0xffffffff870ce45c, 0xffffffff87200130, 0x0, .. snip ..},
+    ....
+      }
+    }
+
+[I.23] From the stack_record structures, we can find the the allocation and freeing paths in the respective entries list. 
+
+    Allocation stack: 
+
+    crash> sym 0xffffffff8677a525, 0xffffffffc0c677d8, 0xffffffffc0c67a73, 0xffffffffc0c6c8bf, 0xffffffff86865029, 0xffffffff86865ea0, 0xffffffff870ce45c, 0xffffffff87200130, 0xffff9188590f58c0, 0xffff9188590f58c0
+    ffffffff8677a525 (T) kmalloc_trace+0x25 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/mm/slab_common.c: 1082
+    ffffffffc0c677d8 (t) find_or_create_cached_dir+0xc8 [cifs] /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/./include/linux/slab.h: 567
+    ffffffffc0c67a73 (T) open_cached_dir+0x153 [cifs] /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/smb/client/cached_dir.c: 173
+    ffffffffc0c6c8bf (T) cifs_readdir+0xdf [cifs] /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/smb/client/readdir.c: 1049
+    ffffffff86865029 (T) iterate_dir+0x179 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/readdir.c: 65
+    ffffffff86865ea0 (T) __x64_sys_getdents64+0x80 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/readdir.c: 370
+    ffffffff870ce45c (T) do_syscall_64+0x5c /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/arch/x86/entry/common.c: 52
+    ffffffff87200130 (T) entry_SYSCALL_64_after_hwframe+0x78 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/arch/x86/entry/entry_64.S: 130
+
+
+    Freeing stack: 
+
+    crash> sym 0xffffffffc0c6c8bf, 0xffffffff86865029, 0xffffffff86865ea0, 0xffffffff870ce45c, 0xffffffff87200130, 
+                         open_cached_dir+0x8b8
+    ffffffffc0c6c8bf (T) cifs_readdir+0xdf [cifs] /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/smb/client/readdir.c: 1049
+    ffffffff86865029 (T) iterate_dir+0x179 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/readdir.c: 65
+    ffffffff86865ea0 (T) __x64_sys_getdents64+0x80 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/fs/readdir.c: 370
+    ffffffff870ce45c (T) do_syscall_64+0x5c /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/arch/x86/entry/common.c: 52
+    ffffffff87200130 (T) entry_SYSCALL_64_after_hwframe+0x78 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/arch/x86/entry/entry_64.S: 130
+
+
