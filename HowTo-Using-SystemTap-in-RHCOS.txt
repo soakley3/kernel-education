@@ -1,0 +1,207 @@
+Lucas Oakley
+19 February 2025
+
+
+Build a RHEL VM with a matching kernel Z streamt to the OCP release.
+For example, for a customer running OCP 4.14, you'll build a RHEL 9.2 
+based VM. Do a minumal RHEL installation. See [1] for more information 
+on which OCP releases use which kernel Z streams.
+
+        [1] RHEL Versions Utilized by RHEL CoreOS and OCP
+            https://access.redhat.com/articles/6907891
+
+Login to your RHEL VM via SSH and do the following: 
+
+    [root@localhost ~]# subscription-manager register        <<< use your rhn-support-...
+    [root@localhost ~]# yum install kernel-...               <<< install the kernel matching the customer's system
+    [root@localhost ~]# yum install podman
+
+    [root@localhost ~]# reboot                               <<< reboot into the kernel the customer is using.
+
+    [root@localhost ~]# podman login registry.redhat.io      <<< use your account...
+
+Now start up the container we're going to base our image on. This should match the release the OCP version uses, i.e. 9.2. below. 
+
+    [root@localhost ~]# podman run --name systemtap-tools --tty --interactive registry.redhat.io/ubi9:9.2    <<< notice the 9.2 is related to the rhel release.
+    [root@fa9e824d5482 /]#                                                                                   <<< notice the session change
+
+    [root@fa9e824d5482 /]# yum install systemtap bison flex openssl-devel wget -y 
+
+Since subscription-manager isn't available within a container, we need to source our kernel related RPMs in another way.
+You can find them in the website's package browser or in the following brew links. Obviously the brew links are only 
+accessible behind the firewall. 
+
+    [root@fa9e824d5482 /]# wget <links to kernel-{,core,modules,modules-core,modules-extra,debuginfo,kernel-debuginfo-common-x86_64,devel}...
+
+While we're only installing the kernel-debuginfo* and kernel-devel packages, the kernel, kernel-core, kernel-modules* are dependencies
+and the manual installation of the kernel-debuginfo* and kernel-devel packages in the container will fail if the dependencies are not present.
+
+    [root@fa9e824d5482 /]# rpm -ivh kernel-debuginfo-5.14.0-284.82.1.el9_2.x86_64.rpm kernel-debuginfo-common-x86_64-5.14.0-284.82.1.el9_2.x86_64.rpm kernel-devel-5.14.0-284.82.1.el9_2.x86_64.rpm
+    Verifying...                          ################################# [100%]
+    Preparing...                          ################################# [100%]
+    Updating / installing...
+       1:kernel-debuginfo-common-x86_64-5.################################# [ 33%]
+       2:kernel-debuginfo-5.14.0-284.82.1.################################# [ 67%]
+       3:kernel-devel-5.14.0-284.82.1.el9_################################# [100%]
+
+
+Place your systemtap in the Container:
+
+    [root@fa9e824d5482 /]# vim <watchdog.stp>                     <<< paste in the systemtap driver 
+
+
+Now go to https://quay.io/ and sign in with your rhn-support-... account. 
+Hit the + at the top right of the screen and select "New repository".
+In the "Repository Name" provide an easygoing repository name, like "case03993396". 
+Select "public", not private, and then "empty repository"., then "Create public repository".
+
+Go to the top right, and click your account settings. Then set a "CLI Password". 
+After this click "Generate Encrypted Password", then click "podman login" and copy
+the text output it provides you: 
+
+        podman login -u='rhn-support-soakley' -p='.......................' quay.io
+
+
+Now open a secondary session and ssh into your RHEL VM via SSH. 
+Once in, run the following podman commands to push the container you've built to the registry. 
+
+    [root@localhost ~]# podman login -u='rhn-support-soakley' -p='.....................' quay.io
+
+
+Go back to the repository you made and reference the podman commands it provides you: 
+
+        podman pull quay.io/rhn-support-soakley/lucas-03993396/
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+Now commit and push the container you created. This is going to take a while. 
+
+    [root@localhost ~]# podman commit systemtap-tools localhost/systemtap-tools:latest                
+    [root@localhost ~]# podman tag localhost/systemtap-tools:latest quay.io/rhn-support-soakley/lucas-03993396/systemtap-tools:latest
+                                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    [root@localhost ~]# podman push quay.io/rhn-support-soakley/lucas-03993396/systemtap-tools:latest
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+
+Now go back to your repositories and find the right one and that the content exists:
+
+        https://quay.io/repository/
+
+Here is the link I found: 
+
+        https://quay.io/repository/rhn-support-soakley/lucas-03993396/systemtap-tools
+
+Click on the gear on the left hand side of the page, and then click "Make public" to make the repository publicly accessible. 
+
+
+Your container is now publicly accessible. You'll need to test this out before giving it to a customer. 
+
+---------------
+
+
+
+
+
+Try it out on a test system. 
+Download `oc` from here: 
+
+    ... internal only link ... 
+
+Download the tarball `openshift-client-linux-4.14.37.tar.gz`: 
+You can checkout a test cluster with test nodes from ... internal only link ...
+
+Then use the `oc` binary provided above to descrive and access the cluster. 
+
+
+
+Choose a test node to try out your systemtap on: 
+
+
+    $ ./oc get nodes -o wide 
+    NAME             STATUS   ROLES                  AGE     VERSION         INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                                                       KERNEL-VERSION                 CONTAINER-RUNTIME
+    ...nodename...   Ready    control-plane,master   15h     v1.27.16+03a907c   ...    <none>        Red Hat Enterprise Linux CoreOS 414.92.202409041930-0 (Plow)   5.14.0-284.82.1.el9_2.x86_64   cri-o://1.27.8-6.rhaos4.14.git06fccaa.el9
+    ...nodename...   Ready    worker                 15h     v1.27.16+03a907c   ...    <none>        Red Hat Enterprise Linux CoreOS 414.92.202409041930-0 (Plow)   5.14.0-284.82.1.el9_2.x86_64   cri-o://1.27.8-6.rhaos4.14.git06fccaa.el9
+    ...nodename...   Ready    worker                 15h     v1.27.16+03a907c   ...    <none>        Red Hat Enterprise Linux CoreOS 414.92.202409041930-0 (Plow)   5.14.0-284.82.1.el9_2.x86_64   cri-o://1.27.8-6.rhaos4.14.git06fccaa.el9
+    ...nodename...   Ready    control-plane,master   15h     v1.27.16+03a907c   ...    <none>        Red Hat Enterprise Linux CoreOS 414.92.202409041930-0 (Plow)   5.14.0-284.82.1.el9_2.x86_64   cri-o://1.27.8-6.rhaos4.14.git06fccaa.el9
+    ...nodename...   Ready    worker                 3h37m   v1.27.16+03a907c   ...    <none>        Red Hat Enterprise Linux CoreOS 414.92.202409041930-0 (Plow)   5.14.0-284.82.1.el9_2.x86_64   cri-o://1.27.8-6.rhaos4.14.git06fccaa.el9
+    ...nodename...   Ready    control-plane,master   15h     v1.27.16+03a907c   ...    <none>        Red Hat Enterprise Linux CoreOS 414.92.202409041930-0 (Plow)   5.14.0-284.82.1.el9_2.x86_64   cri-o://1.27.8-6.rhaos4.14.git06fccaa.el9
+
+
+Login to the chosen node with "oc debug". Make sure to chroot. 
+
+    $ ./oc debug node/...nodename...
+    Starting pod/...nodename... ...
+    To use host binaries, run `chroot /host`
+    # chroot /host 
+    sh-5.1# ls
+    bin  boot  dev	etc  home  lib	lib64  media  mnt  opt	ostree	proc  root  run  sbin  srv  sys  sysroot  tmp  usr  var
+
+
+And start your container with the address you received from the registry! After it downloads, you'll be dropped into the container. 
+
+    sh-5.1# podman run --privileged --name systemtap-tools  --net host --mount type=bind,ro,source=/lib/modules,target=/lib/modules --mount type=bind,rw,source=/var/log,target=/var/log --tty --interactive quay.io/rhn-support-soakley/lucas-03993396/systemtap-tools
+    Trying to pull quay.io/rhn-support-soakley/lucas-03993396/systemtap-tools:latest...
+    Getting image source signatures
+    Copying blob cc7c08d56aad skipped: already exists  
+    Copying blob ae0ed415c8b4 done  
+    Copying config df347a4c7a done  
+    Writing manifest to image destination
+    Storing signatures
+
+
+    [root@ip-10-0-64-50 /]# ls -lah
+    total 778M
+    dr-xr-xr-x.   1 root root   51 Feb 19 20:15 .
+    dr-xr-xr-x.   1 root root   51 Feb 19 20:15 ..
+    dr-xr-xr-x.   2 root root    6 Aug  9  2021 afs
+    lrwxrwxrwx.   1 root root    7 Aug  9  2021 bin -> usr/bin
+    dr-xr-xr-x.   2 root root    6 Aug  9  2021 boot
+    drwxr-xr-x.  13 root root 3.0K Feb 19 20:03 dev
+    drwxr-xr-x.   1 root root 4.0K Feb 19 18:01 etc
+    drwxr-xr-x.   2 root root    6 Aug  9  2021 home
+    -rw-r--r--.   1 root root 1.9M Aug 22 16:45 kernel-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root  16M Aug 22 16:46 kernel-core-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root 590M Aug 22 16:47 kernel-debuginfo-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root  70M Aug 22 16:46 kernel-debuginfo-common-x86_64-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root  18M Aug 22 16:47 kernel-devel-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root  37M Aug 22 16:46 kernel-modules-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root  35M Aug 22 16:46 kernel-modules-core-5.14.0-284.82.1.el9_2.x86_64.rpm
+    -rw-r--r--.   1 root root 2.6M Aug 22 16:46 kernel-modules-extra-5.14.0-284.82.1.el9_2.x86_64.rpm
+    lrwxrwxrwx.   1 root root    7 Aug  9  2021 lib -> usr/lib
+    lrwxrwxrwx.   1 root root    9 Aug  9  2021 lib64 -> usr/lib64
+    -rw-rw-rw-.   1 root root  12M Feb 19 20:15 lo_watchdog.ko
+    drwx------.   2 root root    6 Oct 18  2023 lost+found
+    drwxr-xr-x.   2 root root    6 Aug  9  2021 media
+    drwxr-xr-x.   2 root root    6 Aug  9  2021 mnt
+    drwxr-xr-x.   2 root root    6 Aug  9  2021 opt
+    dr-xr-xr-x. 869 root root    0 Feb 19 20:03 proc
+    dr-xr-x---.   1 root root   24 Feb 19 20:15 root
+    drwxr-xr-x.   1 root root   39 Feb 19 17:38 run
+    lrwxrwxrwx.   1 root root    8 Aug  9  2021 sbin -> usr/sbin
+    drwxr-xr-x.   2 root root    6 Aug  9  2021 srv
+    dr-xr-xr-x.  13 root root    0 Feb 19 19:03 sys
+    drwxrwxrwt.   1 root root    6 Feb 19 20:21 tmp
+    drwxr-xr-x.   1 root root   95 Oct 18  2023 usr
+    drwxr-xr-x.   1 root root   41 Oct 18  2023 var
+    -rw-r--r--.   1 root root  957 Feb 19 18:08 watchdog.stp
+
+
+Compile the SystemTap driver to a KO. 
+
+
+    [root@ip-10-0-64-50 /]# stap -v -g -p 4 -m lo_watchdog.ko watchdog.stp 
+    Truncating module name to 'lo_watchdog'
+    Pass 1: parsed user script and 484 library scripts using 117856virt/94392res/14644shr/79108data kb, in 150usr/40sys/188real ms.
+    Pass 2: analyzed script: 3 probes, 24 functions, 2 embeds, 0 globals using 182092virt/159828res/15904shr/143344data kb, in 1670usr/870sys/2621real ms.
+    Pass 3: translated to C into "/tmp/stapNxAT0x/lo_watchdog_src.c" using 182868virt/160796res/16160shr/144120data kb, in 400usr/170sys/573real ms.
+    /tmp/stapNxAT0x/lo_watchdog_src.o: warning: objtool: _stp_vsprint_memory+0x344: call to __get_user_nocheck_1() with UACCESS enabled
+    lo_watchdog.ko
+    Pass 4: compiled C into "lo_watchdog.ko" in 33750usr/5130sys/8355real ms.
+
+Load the KO. I am not looking for information logged to a file so I can disconnect from the session.
+After disconnecting from the session, the SystemTap probes will still be present my systemtap 
+will panic the system when the probe is hit, and save a vmcore. 
+
+    [root@ip-10-0-64-50 /]# staprun -L lo_watchdog.ko 
+    [root@ip-10-0-64-50 /]# exit
