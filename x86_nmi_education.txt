@@ -1,0 +1,519 @@
+
+
+14 February 2025 
+Lucas Oakley (stlucas)
+
+Updated 1 March 2025 to improve the explanation.
+
+
+
+
+
+What is an NMI and how is it handled? 
+This starts with a focus on x86 architecture. 
+
+
+
+
+
+[INVESTIGATION:]
+~~~~~~~~~~~~~~~~
+
+[I.1]   In our case work, we often reference using an "NMI", or non-maskable interrupt,
+        to manually panic a system and generate a vmcore kernel memory dump in the event
+        that a system is hung. More details are available in [1], referencing the sysctl
+        knobs that enable us to do this. 
+
+               [1] An Introduction to Non-Maskable Interrupts (NMIs)
+                   https://access.redhat.com/articles/267533
+
+            kernel.unknown_nmi_panic = 1
+            kernel.panic_on_unrecovered_nmi = 1
+            kernel.panic_on_io_nmi = 1
+
+[I.2]   But what is a non-maskable interrupt in comparison to a maskable interrupt? 
+        Before explaining the difference, let's first understand the concept of an 
+        interrupt. The KCS [1] explains this very well: 
+
+            ~~~
+            What is an Interrupt? 
+
+            Modern systems architecture has created tightly coupled connect 
+            between system components. Work for system level components (storage, 
+            network, display, etc) can be handed off to a component for completion. 
+            Rather than wait for the component the main CPU can be tasked to do 
+            other pending work.
+
+            When the component has completed its work it will raise a signal to the 
+            main processor. The main processor considers this signal an "interrupt", 
+            as the current work on the CPU will be interrupted immediately Each component
+            has a number assigned to it.
+            ~~~
+
+[I.3]   Reading the above, we know that when a CPU is interrupted it will switch from
+        the work it's performing to executing the interrupt's specific operating system
+        handler code. Under certain circumstances, like in critical sections of the 
+        kernel code, switching between work and an interrupt handler can lead to lock
+        mishandling or other issues. In this case, we'd need to prevent the CPU from 
+        being interrupted while operating in whatever critical section of the code.
+        Something else to consider is that perhaps only certain CPUs should service 
+        certain interrupts. This means that there needs to be a mechanism to 
+        disable - or mask - the handling of some interrupts. So how does this happen?
+
+        Per the Intel Manual: 
+
+            ~~~
+            6.8 ENABLING AND DISABLING INTERRUPTS
+
+            The processor inhibits the generation of some interrupts, depending on 
+            the state of the processor and of the IF and RF flags in the EFLAGS 
+            register, as described in the following sections.
+            ~~~
+
+[I.4]   So, what is the difference between maskable interrupts and non-maskable 
+        interrupts? The Intel Manual outlines how we mask interrupts below. When the 
+        IF (Interrupt Flag, bit 9 in the EFLAGS register) is set, interrupts are serviced
+        by the CPU. When the IF is not set then interrupts are not serviced.  
+
+            ~~~
+            6.8.1 Masking Maskable Hardware Interrupts
+
+            The IF flag can disable the servicing of maskable hardware interrupts received
+            on the processor’s INTR pin or through the local APIC (see Section 6.3.2, 
+            “Maskable Hardware Interrupts”). When the IF flag is clear, the processor 
+            inhibits interrupts delivered to the INTR pin or through the local APIC from 
+            generating an internal interrupt request; when the IF flag is set, interrupts
+            delivered to the INTR or through the local APIC pin are processed as normal 
+            external interrupts.
+            ~~~
+
+[I.5]   As an example, in the stack below the EFLAGS register (also called RFLAGS) 
+        contained value 0x00000246, indicating that bits 1, 2, 6, and 9 were set at the 
+        time of the exception. Bit 9 - or the IF - is enabled, and thus interrupts are 
+        not masked.   
+
+            ~~~
+            crash> bt -c 3
+            PID: 0        TASK: ffff8a91c1ed4000  CPU: 3    COMMAND: "swapper/3"
+             #0 [fffffe7773c3ee48] crash_nmi_callback at ffffffff95661a63
+             #1 [fffffe7773c3ee50] nmi_handle at ffffffff9562e163
+             #2 [fffffe7773c3eea8] default_do_nmi at ffffffff96013069
+             #3 [fffffe7773c3eec8] do_nmi at ffffffff9562e6cc
+             #4 [fffffe7773c3eef0] end_repeat_nmi at ffffffff96201678
+                [exception RIP: native_safe_halt+0xe]
+                RIP: ffffffff9602645e  RSP: ffffb4850194be28  RFLAGS: 00000246        <<<
+                RAX: 0000000080004000  RBX: ffff8a93dc7bf864  RCX: 0000000000000020
+                RDX: ffffffff95bc6ea0  RSI: ffffffff974d1ce0  RDI: 0000000000000001
+                RBP: ffff8a93dc7bf864   R8: 0000000000000001   R9: ffff8a93dc7bf800
+                R10: 00000000000026ca  R11: ffff8a94efdb2484  R12: 0000000000000001
+                R13: ffffffff974d1ce0  R14: 0000000000000001  R15: 0000000000000001
+                ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+            --- <NMI exception stack> ---
+             #5 [ffffb4850194be28] native_safe_halt at ffffffff9602645e
+             #6 [ffffb4850194be28] acpi_idle_do_entry at ffffffff96026d33
+             #7 [ffffb4850194be38] acpi_idle_enter at ffffffff96026f6f
+             #8 [ffffb4850194be50] cpuidle_enter_state at ffffffff95dc1176
+             #9 [ffffb4850194bea0] cpuidle_enter at ffffffff95dc15ac
+            #10 [ffffb4850194bec0] do_idle at ffffffff9573555f
+            #11 [ffffb4850194bf10] cpu_startup_entry at ffffffff9573579f
+            #12 [ffffb4850194bf30] start_secondary at ffffffff95663d27
+            #13 [ffffb4850194bf50] secondary_startup_64_no_verify at ffffffff95600146
+
+            crash> eval -b 0x00000246
+            hexadecimal: 246  
+                decimal: 582  
+                  octal: 1106
+                 binary: 0000000000000000000000000000000000000000000000000000001001000110
+               bits set: 9 6 2 1        <<<
+            ~~~
+
+[I.6]   In this stack below, we see that the EFLAGS contained 0x00000002. Only bit 1 was
+        set. Without bit 9 set, we know that interrupts are masked. 
+
+            ~~~
+            crash> bt -c 8 
+            PID: 2348     TASK: ff46d0159f040000  CPU: 8    COMMAND: "a.out"
+             #0 [fffffe4539986a50] machine_kexec at ffffffff904782f7
+             #1 [fffffe4539986aa8] __crash_kexec at ffffffff905ef95a
+             #2 [fffffe4539986b68] panic at ffffffff9102c810
+             #3 [fffffe4539986bf0] watchdog_overflow_callback at ffffffff90632a6f
+             #4 [fffffe4539986c08] __perf_event_overflow at ffffffff90711ee2
+             #5 [fffffe4539986c38] handle_pmi_common at ffffffff90412549
+             #6 [fffffe4539986e08] intel_pmu_handle_irq at ffffffff90412f90
+             #7 [fffffe4539986e48] perf_event_nmi_handler at ffffffff90404c98
+             #8 [fffffe4539986e68] nmi_handle at ffffffff9043005b
+             #9 [fffffe4539986eb0] default_do_nmi at ffffffff91083fc0
+            #10 [fffffe4539986ed0] exc_nmi at ffffffff910841bf
+            #11 [fffffe4539986ef0] end_repeat_nmi at ffffffff912016e9
+                [exception RIP: native_queued_spin_lock_slowpath+0x72]
+                RIP: ffffffff91098eb2  RSP: ff6803f24f027818  RFLAGS: 00000002      <<<
+                RAX: 0000000000000001  RBX: ff6803f24f0279bf  RCX: 0000000000000000
+                RDX: 0000000000000000  RSI: 0000000000000000  RDI: ffffffff9318d080
+                RBP: ffffffff9318d080   R8: 30613678302f3462   R9: 3178302b746c7561
+                R10: 61665f726464615f  R11: 726573755f6f6420  R12: 0000000000000046
+                R13: ffffffff92ea8b40  R14: ffffffff92ea8b40  R15: ffffffff9318d080
+                ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0000
+            --- <NMI exception stack> ---
+            #12 [ff6803f24f027818] native_queued_spin_lock_slowpath at ffffffff91098eb2
+            #13 [ff6803f24f027838] _raw_spin_lock_irqsave at ffffffff91098640
+            #14 [ff6803f24f027848] serial8250_console_write at ffffffff90bba199
+            #15 [ff6803f24f0278d8] __console_emit_next_record at ffffffff905913b2
+            #16 [ff6803f24f0279a8] console_unlock at ffffffff905919d3
+            #17 [ff6803f24f0279f8] vprintk_emit at ffffffff905931e8
+            #18 [ff6803f24f027a40] _printk at ffffffff91032d79
+            #19 [ff6803f24f027aa0] show_trace_log_lvl at ffffffff91025709
+            #20 [ff6803f24f027b98] dump_stack_lvl at ffffffff9104b023
+            #21 [ff6803f24f027bb0] dump_header at ffffffff9103a31e
+            #22 [ff6803f24f027bd0] oom_kill_process.cold at ffffffff9103a515
+            #23 [ff6803f24f027bf8] out_of_memory at ffffffff907374ad
+            #24 [ff6803f24f027c30] mem_cgroup_out_of_memory at ffffffff90802b31
+            #25 [ff6803f24f027ca8] try_charge_memcg at ffffffff90808083
+            #26 [ff6803f24f027d48] charge_memcg at ffffffff90808982
+            #27 [ff6803f24f027d68] __mem_cgroup_charge at ffffffff9080a2e9
+            #28 [ff6803f24f027d88] do_anonymous_page at ffffffff9077ca05
+            #29 [ff6803f24f027dc0] __handle_mm_fault at ffffffff90784b5b
+            #30 [ff6803f24f027ea0] handle_mm_fault at ffffffff90784f7d
+            #31 [ff6803f24f027ed8] do_user_addr_fault at ffffffff9048ade4
+            #32 [ff6803f24f027f28] exc_page_fault at ffffffff91086aa2
+            #33 [ff6803f24f027f50] asm_exc_page_fault at ffffffff91200c12
+                RIP: 00007f9463990eba  RSP: 00007fffba49b518  RFLAGS: 00010206
+                RAX: 0000000000000000  RBX: 0000000000000000  RCX: 00000000000bd010
+                RDX: 00007f9417441010  RSI: 0000000000000000  RDI: 00007f9417484000
+                RBP: 00007fffba49b530   R8: 00007f9417441010   R9: 0000000000000000
+                R10: 0000000000000022  R11: 0000000000000246  R12: 00007fffba49b648
+                R13: 0000000000401156  R14: 0000000000403e08  R15: 00007f9463b4e000
+                ORIG_RAX: ffffffffffffffff  CS: 0033  SS: 002b
+
+            crash> eval -b 0x00000002
+            hexadecimal: 2  
+                decimal: 2  
+                  octal: 2
+                 binary: 0000000000000000000000000000000000000000000000000000000000000010
+               bits set: 1      <<<
+            ~~~
+
+[I.7]   However, a non-maskable interrupt is not constrained by the IF, thus isn't masked
+        and is serviced immediately by the CPU.
+
+            ~~~
+            The IF flag does not affect non-maskable interrupts (NMIs) delivered to the NMI
+            pin or delivery mode NMI messages delivered through the local APIC, nor does 
+            it affect processor generated exceptions. As with the other flags in the EFLAGS
+            register, the processor clears the IF flag in response to a hardware reset.
+            ~~~
+
+[I.8]   So how does a non-maskable interrupt happen? In one of two ways: 
+
+            ~~~
+            6.7 NONMASKABLE INTERRUPT (NMI)
+            The nonmaskable interrupt (NMI) can be generated in either of two ways:
+
+              o. External hardware asserts the NMI pin.
+              o. The processor receives a message on the system bus (Pentium 4, Intel 
+                 Core Duo, Intel Core 2, Intel Atom, and Intel Xeon processors) or the
+                 APIC serial bus (P6 family and Pentium processors) with a delivery mode 
+                 NMI.
+            ~~~
+
+[I.9]   What happens when the hardware generates a non-maskable interrupt? The work 
+        currently being done by the CPU is interrupted and the CPU immediately begins
+        executing the NMI handler code provided by the operating system. 
+
+            ~~~
+            When the processor receives a NMI from either of these sources, the processor
+            handles it immediately by calling the NMI handler pointed to by interrupt 
+            vector number 2. The processor also invokes certain hardware conditions to 
+            ensure that no other interrupts, including NMI interrupts, are received until
+            the NMI handler has completed executing (see Section 6.7.1, “Handling 
+            Multiple NMIs”).
+            ~~~
+
+[I.10]  So how does the CPU begin executing the operating system's NMI handler code?
+        Based on the passage immediately above, we know that the interrupt handler 
+        for vector number 2 is called. The handler function address for each assigned
+        vector exists in the Interrupt Descriptor Table (IDT).
+
+            ~~~
+            6.2 EXCEPTION AND INTERRUPT VECTORS
+
+            To aid in handling exceptions and interrupts, each architecturally defined 
+            exception and each interrupt condition requiring special handling by the 
+            processor is assigned a unique identification number, called a vector number.
+            The processor uses the vector number assigned to an exception or interrupt 
+            as an index into the interrupt descriptor table (IDT). The table provides 
+            the entry point to an exception or interrupt handler (see Section 6.10, 
+            “Interrupt Descriptor Table (IDT)”).
+            ~~~
+
+[I.11]  Here is a RHEL 8.10 system for example. The first 10 vector's entries are shown, 
+        with vector 2 highlighted.  
+
+            ~~~
+            crash> sys
+                  KERNEL: /usr/lib/debug/lib/modules/4.18.0-553.el8_10.x86_64/vmlinux  [TAINTED]
+                DUMPFILE: /proc/kcore
+
+            crash> p idt_table
+            idt_table = $2 = 0xffffffff83c8a000 <idt_table>
+
+            crash> rd idt_table 20
+            ffffffff83c8a000:  82208e0000100d30 00000000ffffffff   0..... .........   <<< vector 0 entry 
+            ffffffff83c8a010:  82208e0300101070 00000000ffffffff   p..... .........   <<< vector 1 entry 
+            ffffffff83c8a020:  82208e02001014c0 00000000ffffffff   ...... .........   <<< vector 2 entry
+            ^^^^^^^^^^^^^^^^
+            ffffffff83c8a030:  8220ee00001010d0 00000000ffffffff   ...... .........
+            ffffffff83c8a040:  8220ee0000100d50 00000000ffffffff   P..... .........
+            ffffffff83c8a050:  82208e0000100d70 00000000ffffffff   p..... .........
+            ffffffff83c8a060:  82208e0000100d90 00000000ffffffff   ...... .........
+            ffffffff83c8a070:  82208e0000100db0 00000000ffffffff   ...... .........
+            ffffffff83c8a080:  82208e0100100dd0 00000000ffffffff   ...... .........
+            ffffffff83c8a090:  82208e0000100e00 00000000ffffffff   ...... .........
+            ~~~
+
+[I.12]  Each table entry is a 0x10 byte gate_desc structure. It's internal members
+        offset_high, offset_middle, and offset_low are concatenated to provide the CPU 
+        with the starting address of the vector's entry function.
+
+            ~~~
+            crash> struct gate_desc
+            typedef struct gate_struct {
+                u16 offset_low;
+                u16 segment;
+                struct idt_bits bits;
+                u16 offset_middle;
+                u32 offset_high;
+                u32 reserved;
+            } gate_desc;
+            SIZE: 0x10
+            ~~~
+
+[I.13]  Based on the table above, this is vector 2's gate_desc structure. 
+
+            ~~~
+            crash> struct gate_desc ffffffff83c8a020
+            struct gate_desc {
+              offset_low = 0x14c0,
+              segment = 0x10,
+              bits = {
+                ist = 0x2,
+                zero = 0x0,
+                type = 0xe,
+                dpl = 0x0,
+                p = 0x1
+              },
+              offset_middle = 0x8220,
+              offset_high = 0xffffffff,
+              reserved = 0x0
+            }
+            ~~~
+
+[I.14]  And concatenating the offset_high, offset_middle, and offset_low, the address is shown: 
+
+            ~~~
+            1.  "0xffffffff" + "0x8220" + "0x14c0"
+            2.  "0xffffffff" + "8220" + "14c0"
+            3.  0xffffffff  8220  14c0
+            4.  0xffffffff822014c0
+
+            crash> sym 0xffffffff822014c0
+            ffffffff822014c0 (T) nmi /usr/src/debug/kernel-4.18.0-553.el8/linux-4.18.0-553.el8_10.x86_64/arch/x86/entry/entry_64.S: 1491
+            ~~~
+
+[I.15]  So when the CPU receives a non-maskable interrupt, it stops servicing the work
+        it was executing and immediately begins executing the vector 2 handler routine,
+        which is shown below to be nmi(). 
+
+            ~~~
+            crash> dis 0xffffffff822014c0
+            0xffffffff822014c0 <nmi>:       clac   
+            0xffffffff822014c3 <nmi+0x3>:   push   %rdx
+            0xffffffff822014c4 <nmi+0x4>:   testb  $0x3,0x10(%rsp)
+            0xffffffff822014c9 <nmi+0x9>:   je     0xffffffff82201570 <nmi+0xb0>
+            0xffffffff822014cf <nmi+0xf>:   swapgs 
+            0xffffffff822014d2 <nmi+0x12>:  cld    
+            0xffffffff822014d3 <nmi+0x13>:  nopl   (%rax)
+            0xffffffff822014d6 <nmi+0x16>:  jmp    0xffffffff822014ea <nmi+0x2a>
+            0xffffffff822014d8 <nmi+0x18>:  mov    %cr3,%rdx
+            0xffffffff822014db <nmi+0x1b>:  nopl   0x0(%rax,%rax,1)
+            0xffffffff822014e0 <nmi+0x20>:  and    $0xffffffffffffe7ff,%rdx
+            0xffffffff822014e7 <nmi+0x27>:  mov    %rdx,%cr3
+            0xffffffff822014ea <nmi+0x2a>:  mov    %rsp,%rdx
+            0xffffffff822014ed <nmi+0x2d>:  mov    %gs:0x600c,%rsp
+            0xffffffff822014f6 <nmi+0x36>:  push   0x28(%rdx)
+            0xffffffff822014f9 <nmi+0x39>:  push   0x20(%rdx)
+            0xffffffff822014fc <nmi+0x3c>:  push   0x18(%rdx)
+            0xffffffff822014ff <nmi+0x3f>:  push   0x10(%rdx)
+            0xffffffff82201502 <nmi+0x42>:  push   0x8(%rdx)
+            0xffffffff82201505 <nmi+0x45>:  push   $0xffffffffffffffff
+            0xffffffff82201507 <nmi+0x47>:  push   %rdi
+            0xffffffff82201508 <nmi+0x48>:  push   %rsi
+            0xffffffff82201509 <nmi+0x49>:  push   (%rdx)
+            0xffffffff8220150b <nmi+0x4b>:  push   %rcx
+            0xffffffff8220150c <nmi+0x4c>:  push   %rax
+            0xffffffff8220150d <nmi+0x4d>:  push   %r8
+            0xffffffff8220150f <nmi+0x4f>:  push   %r9
+            0xffffffff82201511 <nmi+0x51>:  push   %r10
+            0xffffffff82201513 <nmi+0x53>:  push   %r11
+            0xffffffff82201515 <nmi+0x55>:  push   %rbx
+            0xffffffff82201516 <nmi+0x56>:  push   %rbp
+            0xffffffff82201517 <nmi+0x57>:  push   %r12
+            0xffffffff82201519 <nmi+0x59>:  push   %r13
+            0xffffffff8220151b <nmi+0x5b>:  push   %r14
+            0xffffffff8220151d <nmi+0x5d>:  push   %r15
+            0xffffffff8220151f <nmi+0x5f>:  xor    %edx,%edx
+            0xffffffff82201521 <nmi+0x61>:  xor    %ecx,%ecx
+            0xffffffff82201523 <nmi+0x63>:  xor    %r8d,%r8d
+            0xffffffff82201526 <nmi+0x66>:  xor    %r9d,%r9d
+            0xffffffff82201529 <nmi+0x69>:  xor    %r10d,%r10d
+            0xffffffff8220152c <nmi+0x6c>:  xor    %r11d,%r11d
+            0xffffffff8220152f <nmi+0x6f>:  xor    %ebx,%ebx
+            0xffffffff82201531 <nmi+0x71>:  xor    %ebp,%ebp
+            0xffffffff82201533 <nmi+0x73>:  xor    %r12d,%r12d
+            0xffffffff82201536 <nmi+0x76>:  xor    %r13d,%r13d
+            0xffffffff82201539 <nmi+0x79>:  xor    %r14d,%r14d
+            0xffffffff8220153c <nmi+0x7c>:  xor    %r15d,%r15d
+            0xffffffff8220153f <nmi+0x7f>:  jmp    0xffffffff82201557 <nmi+0x97>
+            0xffffffff82201541 <nmi+0x81>:  mov    $0x48,%ecx
+            0xffffffff82201546 <nmi+0x86>:  mov    %gs:0x1dc48,%rdx
+            0xffffffff8220154f <nmi+0x8f>:  mov    %edx,%eax
+            0xffffffff82201551 <nmi+0x91>:  shr    $0x20,%rdx
+            0xffffffff82201555 <nmi+0x95>:  wrmsr  
+            0xffffffff82201557 <nmi+0x97>:  call   0xffffffff82024e90 <entry_untrain_ret>
+            0xffffffff8220155c <nmi+0x9c>:  mov    %rsp,%rdi
+            0xffffffff8220155f <nmi+0x9f>:  mov    $0xffffffffffffffff,%rsi
+            0xffffffff82201566 <nmi+0xa6>:  call   0xffffffff8162e5d0 <do_nmi>
+            0xffffffff8220156b <nmi+0xab>:  jmp    0xffffffff82200af4 <swapgs_restore_regs_and_return_to_usermode>
+            0xffffffff82201570 <nmi+0xb0>:  mov    $0xffffffff822015ed,%rdx
+            0xffffffff82201577 <nmi+0xb7>:  cmp    0x8(%rsp),%rdx
+            0xffffffff8220157c <nmi+0xbc>:  ja     0xffffffff8220158c <nmi+0xcc>
+            0xffffffff8220157e <nmi+0xbe>:  mov    $0xffffffff82201612,%rdx
+            0xffffffff82201585 <nmi+0xc5>:  cmp    0x8(%rsp),%rdx
+            0xffffffff8220158a <nmi+0xca>:  ja     0xffffffff822015cc <nested_nmi_out>
+            0xffffffff8220158c <nmi+0xcc>:  cmpl   $0x1,-0x8(%rsp)
+            0xffffffff82201591 <nmi+0xd1>:  je     0xffffffff822015b4 <nested_nmi>
+            0xffffffff82201593 <nmi+0xd3>:  lea    0x30(%rsp),%rdx
+            0xffffffff82201598 <nmi+0xd8>:  cmp    %rdx,0x20(%rsp)
+            0xffffffff8220159d <nmi+0xdd>:  ja     0xffffffff822015cf <first_nmi>
+            0xffffffff8220159f <nmi+0xdf>:  sub    $0x2000,%rdx
+            0xffffffff822015a6 <nmi+0xe6>:  cmp    %rdx,0x20(%rsp)
+            0xffffffff822015ab <nmi+0xeb>:  jb     0xffffffff822015cf <first_nmi>
+            0xffffffff822015ad <nmi+0xed>:  testb  $0x4,0x19(%rsp)
+            0xffffffff822015b2 <nmi+0xf2>:  je     0xffffffff822015cf <first_nmi>
+            0xffffffff822015b4 <nested_nmi>:        sub    $0x8,%rsp
+            0xffffffff822015b8 <nested_nmi+0x4>:    lea    -0x50(%rsp),%rdx
+            0xffffffff822015bd <nested_nmi+0x9>:    push   $0x18
+            0xffffffff822015bf <nested_nmi+0xb>:    push   %rdx
+            0xffffffff822015c0 <nested_nmi+0xc>:    pushf  
+            0xffffffff822015c1 <nested_nmi+0xd>:    push   $0x10
+            0xffffffff822015c3 <nested_nmi+0xf>:    push   $0xffffffff822015ed
+            0xffffffff822015c8 <nested_nmi+0x14>:   add    $0x30,%rsp
+            0xffffffff822015cc <nested_nmi_out>:    pop    %rdx
+            0xffffffff822015cd <nested_nmi_out+0x1>:        iretq  
+            0xffffffff822015cf <first_nmi>: mov    (%rsp),%rdx
+            0xffffffff822015d3 <first_nmi+0x4>:     push   $0x0
+            0xffffffff822015d5 <first_nmi+0x6>:     sub    $0x28,%rsp
+            0xffffffff822015d9 <first_nmi+0xa>:     push   0x58(%rsp)
+            0xffffffff822015dd <first_nmi+0xe>:     push   0x58(%rsp)
+            0xffffffff822015e1 <first_nmi+0x12>:    push   0x58(%rsp)
+            0xffffffff822015e5 <first_nmi+0x16>:    push   0x58(%rsp)
+            0xffffffff822015e9 <first_nmi+0x1a>:    push   0x58(%rsp)
+            0xffffffff822015ed <repeat_nmi>:        movq   $0x1,0x50(%rsp)
+            0xffffffff822015f6 <repeat_nmi+0x9>:    add    $0x50,%rsp
+            0xffffffff822015fa <repeat_nmi+0xd>:    push   -0x30(%rsp)
+            0xffffffff822015fe <repeat_nmi+0x11>:   push   -0x30(%rsp)
+            0xffffffff82201602 <repeat_nmi+0x15>:   push   -0x30(%rsp)
+            0xffffffff82201606 <repeat_nmi+0x19>:   push   -0x30(%rsp)
+            0xffffffff8220160a <repeat_nmi+0x1d>:   push   -0x30(%rsp)
+            0xffffffff8220160e <repeat_nmi+0x21>:   sub    $0x28,%rsp
+            0xffffffff82201612 <end_repeat_nmi>:    push   $0xffffffffffffffff
+            0xffffffff82201614 <end_repeat_nmi+0x2>:        call   0xffffffff82201200 <paranoid_entry>
+            0xffffffff82201619 <end_repeat_nmi+0x7>:        mov    %rsp,%rdi
+            0xffffffff8220161c <end_repeat_nmi+0xa>:        mov    $0xffffffffffffffff,%rsi
+            0xffffffff82201623 <end_repeat_nmi+0x11>:       call   0xffffffff8162e5d0 <do_nmi>
+            0xffffffff82201628 <end_repeat_nmi+0x16>:       jmp    0xffffffff8220163c <end_repeat_nmi+0x2a>
+            0xffffffff8220162a <end_repeat_nmi+0x18>:       xchg   %ax,%ax
+            0xffffffff8220162c <end_repeat_nmi+0x1a>:       mov    $0x48,%ecx
+            0xffffffff82201631 <end_repeat_nmi+0x1f>:       mov    %r15,%rdx
+            0xffffffff82201634 <end_repeat_nmi+0x22>:       mov    %edx,%eax
+            0xffffffff82201636 <end_repeat_nmi+0x24>:       shr    $0x20,%rdx
+            0xffffffff8220163a <end_repeat_nmi+0x28>:       wrmsr  
+            0xffffffff8220163c <end_repeat_nmi+0x2a>:       jmp    0xffffffff82201672 <end_repeat_nmi+0x60>
+            0xffffffff8220163e <end_repeat_nmi+0x2c>:       jmp    0xffffffff8220166e <end_repeat_nmi+0x5c>
+            0xffffffff82201640 <end_repeat_nmi+0x2e>:       bt     $0xc,%r14
+            0xffffffff82201645 <end_repeat_nmi+0x33>:       jae    0xffffffff82201669 <end_repeat_nmi+0x57>
+            0xffffffff82201647 <end_repeat_nmi+0x35>:       mov    %r14,%r15
+            0xffffffff8220164a <end_repeat_nmi+0x38>:       and    $0x7ff,%r15
+            0xffffffff82201651 <end_repeat_nmi+0x3f>:       bt     %r15,%gs:0x32996
+            0xffffffff8220165b <end_repeat_nmi+0x49>:       jae    0xffffffff82201669 <end_repeat_nmi+0x57>
+            0xffffffff8220165d <end_repeat_nmi+0x4b>:       btr    %r15,%gs:0x32996
+            0xffffffff82201667 <end_repeat_nmi+0x55>:       jmp    0xffffffff8220166e <end_repeat_nmi+0x5c>
+            0xffffffff82201669 <end_repeat_nmi+0x57>:       bts    $0x3f,%r14
+            0xffffffff8220166e <end_repeat_nmi+0x5c>:       mov    %r14,%cr3
+            0xffffffff82201672 <end_repeat_nmi+0x60>:       xchg   %ax,%ax
+            0xffffffff82201674 <end_repeat_nmi+0x62>:       wrgsbase %rbx
+            0xffffffff82201679 <end_repeat_nmi+0x67>:       jmp    0xffffffff82201682 <nmi_restore>
+            0xffffffff8220167b <nmi_no_fsgsbase>:   test   %ebx,%ebx
+            0xffffffff8220167d <nmi_no_fsgsbase+0x2>:       jne    0xffffffff82201682 <nmi_restore>
+            0xffffffff8220167f <nmi_swapgs>:        swapgs 
+            0xffffffff82201682 <nmi_restore>:       pop    %r15
+            0xffffffff82201684 <nmi_restore+0x2>:   pop    %r14
+            0xffffffff82201686 <nmi_restore+0x4>:   pop    %r13
+            0xffffffff82201688 <nmi_restore+0x6>:   pop    %r12
+            0xffffffff8220168a <nmi_restore+0x8>:   pop    %rbp
+            0xffffffff8220168b <nmi_restore+0x9>:   pop    %rbx
+            0xffffffff8220168c <nmi_restore+0xa>:   pop    %r11
+            0xffffffff8220168e <nmi_restore+0xc>:   pop    %r10
+            0xffffffff82201690 <nmi_restore+0xe>:   pop    %r9
+            0xffffffff82201692 <nmi_restore+0x10>:  pop    %r8
+            0xffffffff82201694 <nmi_restore+0x12>:  pop    %rax
+            0xffffffff82201695 <nmi_restore+0x13>:  pop    %rcx
+            0xffffffff82201696 <nmi_restore+0x14>:  pop    %rdx
+            0xffffffff82201697 <nmi_restore+0x15>:  pop    %rsi
+            0xffffffff82201698 <nmi_restore+0x16>:  pop    %rdi
+            0xffffffff82201699 <nmi_restore+0x17>:  add    $0x30,%rsp
+            0xffffffff8220169d <nmi_restore+0x1b>:  std    
+            0xffffffff8220169e <nmi_restore+0x1c>:  movq   $0x0,0x28(%rsp)
+            0xffffffff822016a7 <nmi_restore+0x25>:  iretq  
+            crash> 
+            ~~~
+
+[I.16]  The crash utility's `irq` command will dump the IDT functions for you. Below, 
+        vector 2's handler function nmi() is shown. 
+
+            ~~~
+            crash> help irq 
+            NAME
+              irq - IRQ data
+            ...
+                   -d   dump the intel interrupt descriptor table.
+            ...
+
+            crash> irq -d
+              [0] divide_error
+              [1] debug
+              [2] nmi
+              [3] int3
+              [4] overflow
+              [5] bounds
+              [6] invalid_op
+              [7] device_not_available
+              [8] double_fault
+              [9] coprocessor_segment_overrun
+             [10] invalid_TSS
+             [11] segment_not_present
+             [12] stack_segment
+             [13] general_protection
+             [14] page_fault
+            ~~~
+
+
+[SUMMARY]
+
+    In summary, a non-maskable interrupt is raised by hardware and is serviced
+immediately by the CPU, regardless if interrupts are masked. The handler function
+starting address is provided by the Interrupt Descriptor Table (IDT). With the NMI
+assigned to vector number 2, entry 2 of the IDT stores the function address for the
+routine nmi(). 
+
+
+
