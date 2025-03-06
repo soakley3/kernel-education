@@ -1,0 +1,287 @@
+ppc64le stack unwind example
+14 February 2025
+Lucas Oakley (stlucas)
+
+
+
+This is a brief example of how to do a stack unwind on ppc64le.
+It has a brief annotation of the assembly and a stack frame. 
+
+This assumes so x86 background knowledge.
+
+
+
+
+
+
+
+This is a vmcore from a ppc64le RHEL 8.8 system: 
+
+      KERNEL: /cores/retrace/repos/kernel/ppc64le/usr/lib/debug/lib/modules/4.18.0-477.58.1.el8_8.ppc64le/vmlinux
+
+Let's look at this blocked task:
+
+    crash> ps -m 10318
+    [ 0 02:45:56.018] [UN]  PID: 10318    TASK: c000000131e0d800  CPU: 4    COMMAND: "..."
+
+It's blocked in NFS. 
+
+    crash> bt 10318
+    PID: 10318    TASK: c000000131e0d800  CPU: 4    COMMAND: "..."
+     #0 [c00000012f703350] __schedule at c000000000f7a470
+     #1 [c00000012f703420] schedule at c000000000f7ada8
+     #2 [c00000012f703490] rpc_wait_bit_killable at d00000000c328220 [sunrpc]
+     #3 [c00000012f7034c0] __wait_on_bit at c000000000f7b6f8
+     #4 [c00000012f703510] out_of_line_wait_on_bit at c000000000f7b810
+     #5 [c00000012f703580] __rpc_execute at d00000000c32a84c [sunrpc]
+     #6 [c00000012f703620] rpc_execute at d00000000c32b5fc [sunrpc]
+     #7 [c00000012f703660] rpc_run_task at d00000000c304338 [sunrpc]
+     #8 [c00000012f7036b0] nfs4_do_call_sync at d000000009897e3c [nfsv4]
+     #9 [c00000012f703760] _nfs4_proc_getattr at d0000000098988d0 [nfsv4]
+    #10 [c00000012f703840] nfs4_proc_getattr at d00000000989d5bc [nfsv4]
+    #11 [c00000012f7038c0] __nfs_revalidate_inode at d000000009364c8c [nfs]
+    #12 [c00000012f703950] nfs_access_get_cached at d0000000093581f8 [nfs]
+    #13 [c00000012f7039c0] nfs_do_access at d000000009358398 [nfs]
+    #14 [c00000012f703a70] nfs_permission at d000000009358850 [nfs]
+    #15 [c00000012f703af0] inode_permission.constprop.28 at c0000000005a3760
+    #16 [c00000012f703b30] link_path_walk at c0000000005a3b9c
+    #17 [c00000012f703be0] path_openat at c0000000005a94fc
+    #18 [c00000012f703c70] do_filp_open at c0000000005ab970
+    #19 [c00000012f703da0] sys_openat at c0000000005835b8
+    #20 [c00000012f703e20] system_call at c00000000000b408
+     System Call [c00] exception frame:
+     R0:  000000000000011e    R1:  00007ffff528e510    R2:  00007fff92857300   
+     R3:  ffffffffffffff9c    R4:  00007ffff528e710    R5:  0000000000000000   
+     R6:  0000000000000000    R7:  0000000000000002    R8:  00007fff971fb108   
+     R9:  0000000000000000    R10: 0000000000000000    R11: 0000000000000000   
+     R12: 0000000000000000    R13: 00007fff97202770    R14: 0000000000000000   
+     R15: 0000000000000000    R16: 0000000000000000    R17: 0000000000000000   
+     R18: 0063006100670065    R19: 00007ffff528f7a0    R20: 0000000000000740   
+     R21: 0000000000000000    R22: 0000000000000000    R23: 00000000000006e4   
+     R24: 00000000000006e8    R25: 00007ffff528f8e0    R26: 0000000000000000   
+     R27: 0000000000000001    R28: 00007ffff528e6d0    R29: 0000000000000000   
+     R30: 00007ffff528e710    R31: 0000000000000000   
+     NIP: 00007fff9277135c    MSR: 800000000000d033    OR3: ffffffffffffff9c
+     CTR: 0000000000000000    LR:  00007fff9277133c    XER: 0000000000000000
+     CCR: 0000000044242428    MQ:  0000000000000000    DAR: 00007ffee69c2ed0
+     DSISR: 0000000042000000     Syscall Result: 0000000000000000
+
+
+Let's see how nfs_permission() sets up the branch to nfs_do_access(). 
+Annotated are the function Arguments. The order is important. 
+
+    3191 int nfs_permission(struct inode *inode, int mask)
+    3192 {
+    3193         const struct cred *cred = current_cred();
+    3194         int res = 0;
+    ....
+    3225         res = nfs_do_access(inode, cred, mask);
+                                     ^^^^^  ^^^^  ^^^^
+                                   ARG 1   ARG 2   ARG 3
+
+        3102 static int nfs_do_access(struct inode *inode, const struct cred *cred, int mask)
+        3103 {                        ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^
+                                            ARG 1                 ARG 2              ARG 3 
+
+
+Here are some resources on how Linux uses registers on ppc64le. 
+
+    https://refspecs.linuxfoundation.org/LSB_1.3.0/PPC64/spec.html#SPECIALREGISTERS
+    https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.html
+    https://math-atlas.sourceforge.net/devel/atlas_contrib/node96.html
+
+    Register    Preservation    Purpose
+                   Rules 
+
+    r0          Volatile        Optional in function linkage. Used in function prologues.
+    r1          Nonvolatile     Stack frame pointer.
+    r2          Nonvolatile     Table Of Contents (TOC) pointer. When operating in the kernel, this actually points to the symbol .TOC. c000000001291900 (d) .TOC.
+    r3 – r10    Volatile        Parameter and return values.
+    r11         Volatile        Optional use in function linkage. Used as an environment pointer in languages that require environment pointers.
+    r12         Volatile        Optional use in function linkage. Function entry address at global entry point.
+    r13         Reserved        Thread pointer (paca struct) 
+    r14 – r31   Nonvolatile     Local variables.
+    LR          Volatile        Link register.
+
+From the above, we know that the ppc64le convention states that Argument 1 is passed to the subsequent routine
+via R3, Argument 2 via R4, and Argument 3 via R5: 
+
+    R3: ARG 1
+    R4: ARG 2
+    R5: ARG 3
+
+This is how nfs_permission() sets up R3, R4, and R5 before the branch to nfs_do_access(). 
+
+    crash> dis -rl d000000009358850 | tail 
+    ...
+    0xd000000009358840 <nfs_permission+0xc8>:	mr      r4,r28         << Copy ARG 2 from R28 to R4
+    0xd000000009358844 <nfs_permission+0xcc>:	mr      r5,r31         << Copy ARG 3 from R31 to R5
+    0xd000000009358848 <nfs_permission+0xd0>:	mr      r3,r30         << Copy ARG 1 from R30 to R3
+    0xd00000000935884c <nfs_permission+0xd4>:	bl      0xd000000009358330 <nfs_do_access+0x8>      << branch to nfs_do_access at offset 0x8.
+    0xd000000009358850 <nfs_permission+0xd8>:	mr      r29,r3
+
+This is the function prologue for nfs_do_access(). This is how the stack is built. 
+Notice that we copy the contents of R30 and R28 directly to the stack frame we're building.
+
+    crash> dis -rl d000000009358398 | head -n 20
+    0xd000000009358328 <nfs_do_access>:	addis   r2,r12,6               << Not executed since we branch to nfs_do_access+0x8
+    0xd00000000935832c <nfs_do_access+0x4>:	addi    r2,r2,-15144       << Not executed since we branch to nfs_do_access+0x8
+    0xd000000009358330 <nfs_do_access+0x8>:	mflr    r0                 << Save LR register contents to R0 
+    0xd000000009358334 <nfs_do_access+0xc>:	nop                        << No-op (potential hook for ftrace).
+    0xd000000009358338 <nfs_do_access+0x10>:	mflr    r0             << Save LR register contents to R0 (Think of this similarly to Return Instruction Pointer) 
+    0xd00000000935833c <nfs_do_access+0x14>:	std     r26,-48(r1)    \
+    0xd000000009358340 <nfs_do_access+0x18>:	std     r27,-40(r1)    | save contents of R26, R27, R28, R29, R30 to the stack
+    0xd000000009358344 <nfs_do_access+0x1c>:	std     r28,-32(r1)    |
+    0xd000000009358348 <nfs_do_access+0x20>:	std     r29,-24(r1)    |
+    0xd00000000935834c <nfs_do_access+0x24>:	std     r30,-16(r1)    /
+    0xd000000009358350 <nfs_do_access+0x28>:	std     r0,16(r1)      << save the LR address in R0 to the prior function's frame. 
+    0xd000000009358354 <nfs_do_access+0x2c>:	stdu    r1,-176(r1)    << save the old stack pointer (R1: c00000012f703a70) to the top of the new frame we're creating
+    0xd000000009358358 <nfs_do_access+0x30>:	ld      r9,3192(r13)   << Derive the stack canary from the paca_struct and place it in R9
+    0xd00000000935835c <nfs_do_access+0x34>:	std     r9,120(r1)     << Place the canary value in R9 on the stack. 
+    0xd000000009358360 <nfs_do_access+0x38>:	li      r9,0           << NULL out R9 
+
+
+Let's expand the frame and annotate what was placed on the stack when building the frame: 
+
+    crash> bt 10318 -FFls | less
+    ...
+              .- R1: (stack pointer) after nfs_do_access+0x2c:  R1 = (0xc00000012f703a70 - 176 (decimal) = 0xc00000012f7039c0)
+              |
+    #13 [c00000012f7039c0] nfs_do_access+0x70 at d000000009358398 [nfs]
+        c00000012f7039c0: [c00000012f703a70:thread_stack] 0000000000002000 
+                               old R1^
+        c00000012f7039d0: nfs_do_access+0x70 0000000000000000 
+        c00000012f7039e0: [c00000012f703a20:thread_stack] .TOC.            
+        c00000012f7039f0: [c00000012f703c98:thread_stack] 0000000000000000 
+        c00000012f703a00: [c0000000be5d52a0:mnt_cache] [c00000012f703ad0:thread_stack] 
+        c00000012f703a10: [c0000000c08fc840:dentry] 0000000000000000 
+        c00000012f703a20: [c00000012f703a50:thread_stack] [c00000012f703c98:thread_stack] 
+        c00000012f703a30: [c00000012f703aa0:thread_stack] 41cb6fe69669a100 
+                                                            canary^ 
+        c00000012f703a40: [c0000009adfcc808:kmalloc-2k] 0000000000000004 
+                               R26^                         R27^
+        c00000012f703a50: [c0000000a5f24c00:cred_jar] 0000000000000000 
+                               R28^                       R29^
+        c00000012f703a60: [c0000000fe81bca8:nfs_inode_cache] .TOC.     
+                               R30^       
+    #14 [c00000012f703a70] nfs_permission+0xd8 at d000000009358850 [nfs]
+              |
+              '- R1: (stack pointer) from start of the routine until nfs_do_access+0x2c
+    ...
+
+
+Since R30 and R28 were saved on the stack, we can reference their values to derive ARG 1 and 2 respectively.
+
+    0xd000000009358840 <nfs_permission+0xc8>:	mr      r4,r28         << Copy ARG 2 from R28 to R4
+    0xd000000009358844 <nfs_permission+0xcc>:	mr      r5,r31         << Copy ARG 3 from R31 to R5
+    0xd000000009358848 <nfs_permission+0xd0>:	mr      r3,r30         << Copy ARG 1 from R30 to R3
+
+
+    3102 static int nfs_do_access(struct inode *inode, const struct cred *cred, int mask)
+    3103 {                        ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  
+                                    ARG 1 (from R30)     ARG 2 (from R28)
+
+    R30:     c0000000fe81bca8      ARG 1
+    R28:     c0000000a5f24c00      ARG 2 
+
+
+Argument 1 looks like a valid inode! 
+
+    crash> struct inode c0000000fe81bca8
+    struct inode {
+      i_mode = 0x41ed,
+      i_opflags = 0xa,
+      i_uid = {
+        val = 0x0
+      },
+      i_gid = {
+        val = 0x0
+      },
+      i_flags = 0x82,
+      i_acl = 0xffffffffffffffff,
+      i_default_acl = 0xffffffffffffffff,
+      i_op = 0xd000000009980b00 <nfs4_dir_inode_operations>,
+      i_sb = 0xc000000095b59800,
+      i_mapping = 0xc0000000fe81be20,
+      i_security = 0xc0000000f93dfc40,
+    .. snip .. 
+      i_bytes = 0x0,
+      i_blkbits = 0x14,
+      i_write_hint = WRITE_LIFE_NOT_SET,
+
+
+    crash> mount | grep "MOUNT\|c000000095b59800" 
+         MOUNT           SUPERBLK     TYPE   DEVNAME   DIRNAME
+    c00000009881db00 c000000095b59800 nfs4   ichblpibmnf00.hbl.hec.edst.ibm.com:/nfsshare/exports/hbl_prd_tm9_sapmnt /sapmnt   
+
+
+
+
+Argument 2 looks valid!:
+
+    crash> struct cred c0000000a5f24c00
+    struct cred {
+      usage = {
+        counter = 0x27
+      },
+      uid = {
+        val = 0x495
+      },
+      gid = {
+        val = 0x41f
+      },
+      suid = {
+        val = 0x495
+      },
+      sgid = {
+        val = 0x41f
+      },
+      euid = {
+        val = 0x495
+      },
+      egid = {
+        val = 0x41f
+      },
+      fsuid = {
+        val = 0x495
+      },
+      fsgid = {
+        val = 0x41f
+      },
+      securebits = 0x0,
+      cap_inheritable = {
+        cap = {0x0, 0x0}
+      },
+      cap_permitted = {
+        cap = {0x0, 0x0}
+      },
+      cap_effective = {
+        cap = {0x0, 0x0}
+      },
+      cap_bset = {
+        cap = {0xffffffff, 0x1ff}
+      },
+      cap_ambient = {
+        cap = {0x0, 0x0}
+      },
+      jit_keyring = 0x0,
+      session_keyring = 0xc0000000c195a900,
+      process_keyring = 0x0,
+      thread_keyring = 0x0,
+      request_key_auth = 0x0,
+      security = 0xc0000001283f4c00,
+      user = 0xc0000000a6767400,
+      user_ns = 0xc000000002150598 <init_user_ns>,
+      group_info = 0xc0000000b32ef200,
+      rcu = {
+        next = 0x0,
+        func = 0x0
+      }
+    }
+
+
+
+
+
+
+That is how to do a stack unwind on ppc64le. 
