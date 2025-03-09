@@ -8,7 +8,7 @@ Lucas Oakley (stlucas)
 
 
 RHEL 9.5 slub debug user tracking, and other some other details.
-How to use the U in slub_debug=FZPU.
+How to use the U in slub_debug=FZPU to determine the root cause of Use-After-Free slab corruption.
  
 
 [INVESTIGATION]
