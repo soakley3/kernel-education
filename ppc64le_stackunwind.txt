@@ -212,7 +212,7 @@ Argument 1 looks like a valid inode!
 
     crash> mount | grep "MOUNT\|c000000095b59800" 
          MOUNT           SUPERBLK     TYPE   DEVNAME   DIRNAME
-    c00000009881db00 c000000095b59800 nfs4   ichblpibmnf00.hbl.hec.edst.ibm.com:/nfsshare/exports/hbl_prd_tm9_sapmnt /sapmnt   
+    c00000009881db00 c000000095b59800 nfs4   abc.def.ghi.jkl.mno.com:/nfsshare/exports/test_mount/mnt   
 
 
 
