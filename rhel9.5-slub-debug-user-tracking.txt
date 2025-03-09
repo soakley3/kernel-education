@@ -442,3 +442,215 @@ How to use the U in slub_debug=FZPU.
     ffffffff87200130 (T) entry_SYSCALL_64_after_hwframe+0x78 /usr/src/debug/kernel-5.14.0-503.21.1.el9_5/linux-5.14.0-503.21.1.el9_5.x86_64/arch/x86/entry/entry_64.S: 130
 
 
+[I.24] It looks like this was the path to allocating the object. 
+
+    1012 int cifs_readdir(struct file *file, struct dir_context *ctx)
+    1013 {
+    1014         int rc = 0;
+    1015         unsigned int xid;
+    1016         int i;
+    1017         struct tcon_link *tlink = NULL;
+    1018         struct cifs_tcon *tcon;
+    1019         struct cifsFileInfo *cifsFile;
+    1020         char *current_entry;
+    1021         int num_to_fill = 0;
+    1022         char *tmp_buf = NULL;
+    1023         char *end_of_smb;
+    1024         unsigned int max_len;
+    1025         const char *full_path;
+    1026         void *page = alloc_dentry_path();
+    1027         struct cached_fid *cfid = NULL;
+    1028         struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
+    1029 
+    ....
+    1047 
+    1048         rc = open_cached_dir(xid, tcon, full_path, cifs_sb, false, &cfid);    <<< allocation occurs in here 
+
+        121 /*
+        122  * Open the and cache a directory handle.
+        123  * If error then *cfid is not initialized.
+        124  */
+        125 int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
+        126                     const char *path,
+        127                     struct cifs_sb_info *cifs_sb,
+        128                     bool lookup_only, struct cached_fid **ret_cfid)
+        129 {
+        ...
+        145         struct cached_fid *cfid;
+        146         struct cached_fids *cfids;
+        147         const char *npath;
+        148         int retries = 0, cur_sleep = 1;
+        ...
+        154         ses = tcon->ses;
+        155         cfids = tcon->cfids;
+        156 
+        ...
+        173         cfid = find_or_create_cached_dir(cfids, path, lookup_only, tcon->max_cached_dirs);
+
+             20 static struct cached_fid *find_or_create_cached_dir(struct cached_fids *cfids,
+             21                                                     const char *path,
+             22                                                     bool lookup_only,
+             23                                                     __u32 max_cached_dirs)
+             24 {
+             25         struct cached_fid *cfid;
+             26 
+             27         spin_lock(&cfids->cfid_list_lock);                         <<< cfid_list_lock taken
+             ..
+             52         cfid = init_cached_dir(path);
+
+                581 static struct cached_fid *init_cached_dir(const char *path)
+                582 {
+                583         struct cached_fid *cfid;
+                584 
+                585         cfid = kzalloc(sizeof(*cfid), GFP_ATOMIC);               <<< Allocation here.
+                586         if (!cfid)
+                587                 return NULL;
+                588         cfid->path = kstrdup(path, GFP_ATOMIC);
+                589         if (!cfid->path) {
+                590                 kfree(cfid);
+                591                 return NULL;
+                592         }
+                593 
+                594         INIT_WORK(&cfid->lease_break, smb2_cached_lease_break);
+                595         INIT_LIST_HEAD(&cfid->entry);
+                596         INIT_LIST_HEAD(&cfid->dirents.entries);
+                597         mutex_init(&cfid->dirents.de_mutex);
+                598         spin_lock_init(&cfid->fid_lock);
+                599         kref_init(&cfid->refcount);
+                600         return cfid;                                             <<< return cached_fid object
+                601 }
+
+             ..
+             57         cfid->cfids = cfids;
+             58         cfids->num_entries++;
+             59         list_add(&cfid->entry, &cfids->entries);                     <<< cached_fids->entries list modified here with lock held.
+             60         cfid->on_list = true;
+             61         kref_get(&cfid->refcount);
+             62         spin_unlock(&cfids->cfid_list_lock);                         <<< lock released.
+             63         return cfid;
+             64 }
+
+[I.25] And here is the free'ing path. However, the cached_fids_cfid_list_lock isn't needed before freeing the cached_fid below!
+
+    1012 int cifs_readdir(struct file *file, struct dir_context *ctx)
+    1013 {
+    ....
+    1027         struct cached_fid *cfid = NULL;
+    1028         struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
+    1029 
+    ....
+    1047 
+    1048         rc = open_cached_dir(xid, tcon, full_path, cifs_sb, false, &cfid);   <<< ultimately we allocate and then free in here before continuing up the stack
+
+        121 /*
+        122  * Open the and cache a directory handle.
+        123  * If error then *cfid is not initialized.
+        124  */
+        125 int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
+        126                     const char *path,
+        127                     struct cifs_sb_info *cifs_sb,
+        128                     bool lookup_only, struct cached_fid **ret_cfid)
+        129 {
+        ...
+        145         struct cached_fid *cfid;
+        146         struct cached_fids *cfids;
+        147         const char *npath;
+        148         int retries = 0, cur_sleep = 1;
+        149 
+        150         if (tcon == NULL || tcon->cfids == NULL || tcon->nohandlecache ||
+        151             is_smb1_server(tcon->ses->server) || (dir_cache_timeout == 0))
+        152                 return -EOPNOTSUPP;
+        153 
+        154         ses = tcon->ses;
+        155         cfids = tcon->cfids;
+        ...
+        173         cfid = find_or_create_cached_dir(cfids, path, lookup_only, tcon->max_cached_dirs);    <<< cached_fid allocated here.
+        ...
+        ...
+        372 out:
+        373         if (rc) {
+        374                 if (cfid->is_open)
+        375                         SMB2_close(0, cfid->tcon, cfid->fid.persistent_fid,
+        376                                    cfid->fid.volatile_fid);
+        377                 free_cached_dir(cfid);                                            <<< enter here to free cached_fid but the cached_fids lock isn't held. 
+
+            603 static void free_cached_dir(struct cached_fid *cfid)
+            604 {
+            605         struct cached_dirent *dirent, *q;
+            606 
+            607         dput(cfid->dentry);
+            608         cfid->dentry = NULL;
+            609 
+            610         /*
+            611          * Delete all cached dirent names
+            612          */
+            613         list_for_each_entry_safe(dirent, q, &cfid->dirents.entries, entry) {
+            614                 list_del(&dirent->entry);
+            615                 kfree(dirent->name);
+            616                 kfree(dirent);
+            617         }
+            618 
+            619         kfree(cfid->path);
+            620         cfid->path = NULL;
+            621         kfree(cfid);                                                                <<< cached_fid freed here.
+            622 }
+
+
+        378         } else {
+        379                 *ret_cfid = cfid;
+        380                 atomic_inc(&tcon->num_remote_opens);
+        381         }
+        382         kfree(utf16_path);
+        ...
+        388         return rc;
+        389 }
+
+    ....
+    1085  cache_not_found:                                                                  <<< then we return to cifs_readdir() and call initiate_cifs_search()  
+    ....
+    1090         if (file->private_data == NULL) {
+    1091                 rc = initiate_cifs_search(xid, file, full_path);
+
+
+
+
+[SUMMARY]
+
+Looks like a race when freeing a slab object without holding a lock, leading to a Use-After-Free: 
+
+        CPU 17                                               CPU 8 
+--------------------------------------------------------------------------------------------------
+                                                 |
+PID 1160579 takes the                            |
+cfids->cfid_list_lock lock and then              |
+allocates the cached_fid object, then            |
+releases the cfids->cfid_list_lock               |
+lock in the following path:                      |
+                                                 |
+  cifs_readdir()                                 |
+    open_cached_dir()                            |
+      find_or_create_cached_dir()                |
+        init_cached_dir() (takes and releases    |
+                   cfids->cfid_list_lock lock)   |
+                                                 |
+                                                 |
+                                                 |
+PID 1160579 then frees the cached_fid            |  PID 1160274 calls open_cached_dir_by_dentry() 
+object without taking the                        |  and takes the cfids->cfid_list_lock lock. Then
+cfids->cfid_list_lock lock in the                |  tries to iterate the cfids->entries list
+following path:                                  |  but trips over the race like this:
+                                                 |
+    cifs_readdir()                               |   lookup_fast()
+      open_cached_dir()                          |     cifs_d_revalidate()
+        free_cached_dir()                        |       cifs_revalidate_dentry()
+                                                 |         cifs_revalidate_dentry_attr()
+                                                 |           cifs_dentry_needs_reval()
+                                                 |             open_cached_dir_by_dentry() (takes cfids->cfid_list_lock lock, then panic)
+
+
+Which is fixed with this: 
+
+    [https://lore.kernel.org/all/20241118215028.1066662-4-paul@darkrain42.org/T/]
+    * [PATCH v2 3/4] smb: prevent use-after-free due to open_cached_dir error paths
+
+
