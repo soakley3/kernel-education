@@ -1,0 +1,389 @@
+Some supporting data for the a performance investigation. 
+
+General CPU performance showed elevated %sys during the time of the issue.
+
+An OCP 4.14 (using 9.2.z kernel) node using fips=1 experiences many short-blocked but frequently occurring D state `conmon` tasks
+due to contention around the `crypto_reseed_rng_lock` mutex lock in crypto_devrandom_read(). This gives the
+perception that the system is experiencing a hang due to the frequent uninterruptible blocking when making
+`getrandom` syscalls. The behaviour is reproducible with podman/conmon on RHEL 9.2 and 9.4 with `fips=1` and is a result
+of the blocking flag enabled in getrandom() with fips enabled. The calls come from libgcrypt being loaded as a result of containers
+being created, which then triggers a FIPS self-test. Running enough containers under this configuration can result in the behaviour.
+This will be fixed in RHEL 10.
+
+...
+
+[I.1] As an example, looking at this longest blocked PID, the syscall was getrandom().
+
+    crash> bt 1404066
+    PID: 1404066  TASK: ff2b5465aa46c600  CPU: 25   COMMAND: "conmon"
+     #0 [ff376aff2b7e3c48] __schedule at ffffffff88f3a038
+     #1 [ff376aff2b7e3cb0] schedule at ffffffff88f3a52d
+     #2 [ff376aff2b7e3cc0] schedule_preempt_disabled at ffffffff88f3a831
+     #3 [ff376aff2b7e3cc8] __mutex_lock.constprop.0 at ffffffff88f3b621
+     #4 [ff376aff2b7e3d48] crypto_devrandom_read at ffffffff88900d67
+     #5 [ff376aff2b7e3e98] __x64_sys_getrandom at ffffffff88ae6f64
+     #6 [ff376aff2b7e3ec8] do_syscall_64 at ffffffff88f2e159
+     #7 [ff376aff2b7e3f50] entry_SYSCALL_64_after_hwframe at ffffffff890000dc
+        RIP: 00007f01c9058ad7  RSP: 00007fff26297bd8  RFLAGS: 00000246
+        RAX: ffffffffffffffda  RBX: 0000000000000010  RCX: 00007f01c9058ad7
+        RDX: 0000000000000002  RSI: 0000000000000010  RDI: 00007fff26297bf0
+        RBP: 00007f01c8ffb180   R8: 000055773af93d50   R9: 0000000000000000
+        R10: 0000000000020000  R11: 0000000000000246  R12: 0000000000000010
+        R13: 0000000000000010  R14: 00007fff26297bf0  R15: 0000000000000020
+        ORIG_RAX: 000000000000013e  CS: 0033  SS: 002b
+
+    NUM  SYSTEM CALL                FILE AND LINE NUMBER
+    ...
+    13e  __x64_sys_getrandom        ../drivers/char/random.c: 1488
+
+
+[I.2] The syscall's arguments show that the flags were set to 0x0000000000000002
+
+    1488 SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count, unsigned int,
+    1489                 flags)
+
+    ARG1: RDI: 00007fff26297bf0
+    ARG2: RSI: 0000000000000010
+    ARG3: RDX: 0000000000000002  (flags)
+
+
+[I.3] We call the function pointer on line 1514.
+
+    crash> dis -rl ffffffff88ae6f64
+    ....
+    /usr/src/debug/kernel-5.14.0-284.73.1.el9_2/linux-5.14.0-284.73.1.el9_2.x86_64/drivers/char/random.c: 1514
+    0xffffffff88ae6f52 <__x64_sys_getrandom+0x62>:  mov    %ebx,%edx
+    0xffffffff88ae6f54 <__x64_sys_getrandom+0x64>:  mov    %rbp,%rsi
+    0xffffffff88ae6f57 <__x64_sys_getrandom+0x67>:  mov    %r13,%rdi
+    0xffffffff88ae6f5a <__x64_sys_getrandom+0x6a>:  shr    %edx
+    0xffffffff88ae6f5c <__x64_sys_getrandom+0x6c>:  mov    (%r14),%rax
+    0xffffffff88ae6f5f <__x64_sys_getrandom+0x6f>:  and    $0x1,%edx
+    0xffffffff88ae6f62 <__x64_sys_getrandom+0x72>:  call   *%rax
+    0xffffffff88ae6f64 <__x64_sys_getrandom+0x74>:  nopl   (%rax)
+
+
+    1488 SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count, unsigned int,
+    1489                 flags)
+    1490 {
+    1491         const struct random_extrng *rng;
+    1492 
+    ....
+    1511 
+    1512         if (rng) {
+    1513                 int ret;
+    1514                 ret = rng->extrng_read(buf, count, !!(flags & GRND_RANDOM));
+
+[I.4] Knowing that the function pointer is crypto_devrandom_read(), let's calculate the third parameter, a boolean. It's true.
+
+         25 /* Flags for use with getrandom.  */
+         26 #define GRND_NONBLOCK 0x01
+         27 #define GRND_RANDOM 0x02
+         28 #define GRND_INSECURE 0x04
+
+        crash> px (!!(0x0000000000000002 & 0x02))
+        $8 = 0x1
+
+[I.5] When crypto_devrandom_read() is called `reseed` is true because of the flags passed in from the syscall. 
+
+        247 static ssize_t crypto_devrandom_read(void __user *buf, size_t buflen,
+        248                                      bool reseed)
+        249 {
+        250         struct crypto_rng *rng;
+        251         u8 tmp[256];
+        252         ssize_t ret;
+        253 
+        254         if (!buflen)
+        255                 return 0;
+        256 
+        257         if (reseed) {                                                         <<< we enter here since reseed is true. 
+        258                 u32 flags = 0;
+        259 
+        260                 /* If reseeding is requested, acquire a lock on
+        261                  * crypto_reseed_rng so it is not swapped out until
+        262                  * the initial random bytes are generated.
+        263                  *
+        264                  * The algorithm implementation is also protected with
+        265                  * a separate mutex (drbg->drbg_mutex) around the
+        266                  * reseed-and-generate operation.
+        267                  */
+        268                 mutex_lock(&crypto_reseed_rng_lock);                             <<< tasks get blocked here per the dump 
+        269 
+        270                 /* If crypto_default_rng is not set, it will be seeded
+        271                  * at creation in __crypto_get_default_rng and thus no
+        272                  * reseeding is needed.
+        273                  */
+        274                 if (crypto_reseed_rng)
+        275                         flags |= CRYPTO_TFM_REQ_NEED_RESEED;
+        276 
+        277                 ret = crypto_get_rng(&crypto_reseed_rng);
+        278                 if (ret) {
+        279                         mutex_unlock(&crypto_reseed_rng_lock);
+        280                         return ret;
+        281                 }
+        282 
+        283                 rng = crypto_reseed_rng;
+        284                 crypto_tfm_set_flags(crypto_rng_tfm(rng), flags);
+        285         } else {
+        286                 ret = crypto_get_default_rng();
+        287                 if (ret)
+        288                         return ret;
+        289                 rng = crypto_default_rng;
+        290         }
+        291 
+        292         for (;;) {
+        293                 int err;
+        294                 int i;
+        295 
+        296                 i = min_t(int, buflen, sizeof(tmp));
+        297                 err = crypto_rng_get_bytes(rng, tmp, i);                    <<< call to the next routine when not blocked on the mutex.
+
+            160 static inline int crypto_rng_get_bytes(struct crypto_rng *tfm,
+            161                                        u8 *rdata, unsigned int dlen)
+            162 {
+            163         return crypto_rng_generate(tfm, NULL, 0, rdata, dlen);
+
+                136 static inline int crypto_rng_generate(struct crypto_rng *tfm,
+                137                                       const u8 *src, unsigned int slen,
+                138                                       u8 *dst, unsigned int dlen)
+                139 {
+                140         struct crypto_alg *alg = tfm->base.__crt_alg;
+                141         int ret;
+                142 
+                143         crypto_stats_get(alg);
+                144         ret = crypto_rng_alg(tfm)->generate(tfm, src, slen, dst, dlen);
+
+[I.6] As an example, at the exact moment the dump was created, we see 32 contenders for the crypto_reseed_rng_lock. 
+
+    crash> sym crypto_reseed_rng_lock
+    ffffffff8a09fb00 (d) crypto_reseed_rng_lock
+
+    crash> struct mutex.wait_list ffffffff8a09fb00 -o 
+    struct mutex {
+      [ffffffff8a09fb10] struct list_head wait_list;
+    }
+
+    crash> struct mutex.wait_list ffffffff8a09fb00 -o 
+    struct mutex {
+      [ffffffff8a09fb10] struct list_head wait_list;
+    }
+
+[I.7] While these contenders are fleeting, the longest was blocked for over half a second:
+
+    crash> ps -S
+      RU: 147
+      IN: 77734
+      ID: 647
+      WA: 3
+      ZO: 19
+      UN: 32
+
+    crash> ps -m | grep UN 
+    ...
+    [0 00:00:00.557] [UN]  PID: 1404459  TASK: ff2b5429a30dc600  CPU: 110  COMMAND: "conmon"
+    [0 00:00:00.630] [UN]  PID: 1404066  TASK: ff2b5465aa46c600  CPU: 25   COMMAND: "conmon"
+
+[I.8] All of the contenders are doing a getrandom syscall with flags set to 0x02 which will contend the lock.
+
+   crash> foreach UN bt | grep "ORIG_RAX: 000000000000013e  CS: 0033" -B 4 | grep RDX | awk '{print $2}' | sort -k 2 -r -n | uniq -c
+         32 0000000000000002
+
+[I.9] example of the conmon that is executing past the lock:
+
+    crash> bt -c 57
+    PID: 1404804  TASK: ff2b5467e3e42300  CPU: 57   COMMAND: "conmon"
+     #0 [fffffe0000bd8e58] crash_nmi_callback at ffffffff8845ea5e
+     #1 [fffffe0000bd8e60] nmi_handle at ffffffff884298db
+     #2 [fffffe0000bd8ea8] default_do_nmi at ffffffff88f2fa80
+     #3 [fffffe0000bd8ec8] exc_nmi at ffffffff88f2fc8d
+     #4 [fffffe0000bd8ef0] end_repeat_nmi at ffffffff890015eb
+        [exception RIP: jent_lfsr_time+0xf9]
+        RIP: ffffffff88905220  RSP: ff376aff36d2fa60  RFLAGS: 00000206
+        RAX: 0000000000000000  RBX: ff2b543a83948018  RCX: 0000000000000001
+        RDX: 000000000000c1f8  RSI: 0000000000000004  RDI: ff376aff36d2fa38
+        RBP: ff376aff36d2faa8   R8: 0000000000000020   R9: 00000000c0d06665
+        R10: 00000000170c0fad  R11: 000000002566c50c  R12: ff2b543a47446780
+        R13: 0000000000000020  R14: ff2b543a47446798  R15: 0000000000000020
+        ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+    --- <NMI exception stack> ---
+     #5 [ff376aff36d2fa60] jent_lfsr_time at ffffffff88905220
+     #6 [ff376aff36d2fab0] jent_measure_jitter at ffffffff88905402
+     #7 [ff376aff36d2fae8] jent_gen_entropy at ffffffff88905469
+     #8 [ff376aff36d2fb08] jent_read_entropy at ffffffff889054ea
+     #9 [ff376aff36d2fb40] jent_kcapi_random at ffffffff889059f1
+    #10 [ff376aff36d2fb68] drbg_seed at ffffffff889041f7
+    #11 [ff376aff36d2fc40] drbg_generate at ffffffff889045c9
+    #12 [ff376aff36d2fce0] drbg_kcapi_random at ffffffff889048c3
+    #13 [ff376aff36d2fd58] crypto_devrandom_read at ffffffff88900dfb
+    #14 [ff376aff36d2fea8] __x64_sys_getrandom at ffffffff88ae6f64
+    #15 [ff376aff36d2fed8] do_syscall_64 at ffffffff88f2e159
+    #16 [ff376aff36d2ff50] entry_SYSCALL_64_after_hwframe at ffffffff890000dc
+        RIP: 00007ff3afc58ad7  RSP: 00007ffe32e80e58  RFLAGS: 00000246
+        RAX: ffffffffffffffda  RBX: 0000000000000020  RCX: 00007ff3afc58ad7
+        RDX: 0000000000000002  RSI: 0000000000000020  RDI: 00007ffe32e80e70
+        RBP: 00007ff3afb83180   R8: 00005650ab475d50   R9: 0000000000000000
+        R10: 0000000000020000  R11: 0000000000000246  R12: 0000000000000030
+        R13: 0000000000000030  R14: 00007ffe32e80e70  R15: 0000000000000000
+        ORIG_RAX: 000000000000013e  CS: 0033  SS: 002b
+
+
+[I.10] This behaviour is reproducible in-house and isn't specific to a workload.
+       The <redacted> seems to hit this most easily when surpassing 420 containers. In our reproduction
+       we can use `perf` to record the Userspace call stack leading to the library call that is doing
+       the getrandom syscall with flags set to 0x02.
+
+
+    # perf record -e syscalls:sys_enter_getrandom -ag  --filter 'comm == "conmon"' --call-graph dwarf
+
+
+
+[I.11] Getting this data shows a substantial number of getrandom() calls with flags set to 0x02 when FIPS is in use.
+
+
+[root@rhel9 ~]# perf record -e syscalls:sys_enter_getrandom -ag  --filter 'comm == "conmon"' --call-graph dwarf
+[root@rhel9 ~]# perf script > newperfoutput.txt
+[root@rhel9 ~]# cat newperfoutput.txt
+conmon 3698338 [000] 182911.210198: syscalls:sys_enter_getrandom: buf: 0x7f58e2a014d8, count: 0x00000008, flags: 0x00000001
+            7f58e28ac7e5 ptmalloc_init.part.0+0x35 (/usr/lib64/libc.so.6)
+            7f58e28af584 __GI___libc_malloc+0x1f4 (inlined)
+            7f58e284e40e set_binding_values.part.0+0x1be (/usr/lib64/libc.so.6)
+            7f58e284e6cb __bindtextdomain+0x2b (/usr/lib64/libc.so.6)
+            7f58e25aaa9a gpg_err_init+0x1a (/usr/lib64/libgpg-error.so.0.32.0)
+            7f58e2d211ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d2129b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d37c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+conmon 3698338 [000] 182911.230871: syscalls:sys_enter_getrandom: buf: 0x7fff0ad78da0, count: 0x00000020, flags: 0x00000002
+            7f58e2858ad7 __GI___getrandom+0x17 (/usr/lib64/libc.so.6)
+            7f58e274eefb _gcry_rndgetentropy_gather_random+0xab (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e274f17f drbg_get_entropy+0x18f (inlined)
+            7f58e274f17f drbg_seed+0x18f (inlined)
+            7f58e274f2d5 drbg_instantiate+0xf5 (inlined)
+            7f58e26ee9db drbg_healthcheck_sanity+0x8fb (inlined)
+            7f58e26ee9db drbg_healthcheck+0x8fb (inlined)
+            7f58e26ee9db _gcry_rngdrbg_selftest+0x8fb (inlined)
+            7f58e26ee9db _gcry_random_selftest+0x8fb (inlined)
+            7f58e26ee9db run_random_selftests+0x8fb (inlined)
+            7f58e26ee9db _gcry_fips_run_selftests+0x8fb (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e26d5be0 _gcry_global_constructor+0x30 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e2d211ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d2129b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d37c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+conmon 3698338 [000] 182911.240507: syscalls:sys_enter_getrandom: buf: 0x7fff0ad78da0, count: 0x00000010, flags: 0x00000002
+            7f58e2858ad7 __GI___getrandom+0x17 (/usr/lib64/libc.so.6)
+            7f58e274eefb _gcry_rndgetentropy_gather_random+0xab (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e274f17f drbg_get_entropy+0x18f (inlined)
+            7f58e274f17f drbg_seed+0x18f (inlined)
+            7f58e274f2d5 drbg_instantiate+0xf5 (inlined)
+            7f58e26ee9db drbg_healthcheck_sanity+0x8fb (inlined)
+            7f58e26ee9db drbg_healthcheck+0x8fb (inlined)
+            7f58e26ee9db _gcry_rngdrbg_selftest+0x8fb (inlined)
+            7f58e26ee9db _gcry_random_selftest+0x8fb (inlined)
+            7f58e26ee9db run_random_selftests+0x8fb (inlined)
+            7f58e26ee9db _gcry_fips_run_selftests+0x8fb (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e26d5be0 _gcry_global_constructor+0x30 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e2d211ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d2129b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d37c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+conmon 3698338 [000] 182911.245573: syscalls:sys_enter_getrandom: buf: 0x7fff0ad78840, count: 0x00000020, flags: 0x00000002
+            7f58e2858ad7 __GI___getrandom+0x17 (/usr/lib64/libc.so.6)
+            7f58e274eefb _gcry_rndgetentropy_gather_random+0xab (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e274f17f drbg_get_entropy+0x18f (inlined)
+            7f58e274f17f drbg_seed+0x18f (inlined)
+            7f58e274f2d5 drbg_instantiate+0xf5 (inlined)
+            7f58e274f442 _drbg_init_internal+0xd2 (inlined)
+            7f58e275bd38 _gcry_rngdrbg_inititialize+0x198 (inlined)
+            7f58e275bd38 _gcry_rngdrbg_inititialize+0x198 (inlined)
+            7f58e275bd38 _gcry_rngdrbg_randomize.constprop.0+0x198 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e27572f4 _gcry_create_nonce+0xc4 (inlined)
+            7f58e27572f4 _gcry_mpi_randomize+0xc4 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e272291b secret_blinded+0x5b (inlined)
+            7f58e2725211 rsa_sign+0x3c1 (inlined)
+            7f58e26f7c67 _gcry_pk_sign_md+0x387 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e2724a30 selftest_hash_sign_2048+0xc0 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e27260d4 selftests_rsa+0x3d4 (inlined)
+            7f58e27260d4 run_selftests+0x3d4 (inlined)
+            7f58e26ee515 _gcry_pk_selftest+0x435 (inlined)
+            7f58e26ee515 run_pubkey_selftests+0x435 (inlined)
+            7f58e26ee515 _gcry_fips_run_selftests+0x435 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e26d5be0 _gcry_global_constructor+0x30 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e2d211ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d2129b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d37c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+
+conmon 3698338 [001] 182911.255876: syscalls:sys_enter_getrandom: buf: 0x7fff0ad78840, count: 0x00000010, flags: 0x00000002
+            7f58e2858ad7 __GI___getrandom+0x17 (/usr/lib64/libc.so.6)
+            7f58e274eefb _gcry_rndgetentropy_gather_random+0xab (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e274f17f drbg_get_entropy+0x18f (inlined)
+            7f58e274f17f drbg_seed+0x18f (inlined)
+            7f58e274f2d5 drbg_instantiate+0xf5 (inlined)
+            7f58e274f442 _drbg_init_internal+0xd2 (inlined)
+            7f58e275bd38 _gcry_rngdrbg_inititialize+0x198 (inlined)
+            7f58e275bd38 _gcry_rngdrbg_inititialize+0x198 (inlined)
+            7f58e275bd38 _gcry_rngdrbg_randomize.constprop.0+0x198 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e27572f4 _gcry_create_nonce+0xc4 (inlined)
+            7f58e27572f4 _gcry_mpi_randomize+0xc4 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e272291b secret_blinded+0x5b (inlined)
+            7f58e2725211 rsa_sign+0x3c1 (inlined)
+            7f58e26f7c67 _gcry_pk_sign_md+0x387 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e2724a30 selftest_hash_sign_2048+0xc0 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e27260d4 selftests_rsa+0x3d4 (inlined)
+            7f58e27260d4 run_selftests+0x3d4 (inlined)
+            7f58e26ee515 _gcry_pk_selftest+0x435 (inlined)
+            7f58e26ee515 run_pubkey_selftests+0x435 (inlined)
+            7f58e26ee515 _gcry_fips_run_selftests+0x435 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e26d5be0 _gcry_global_constructor+0x30 (/usr/lib64/libgcrypt.so.20.4.0)
+            7f58e2d211ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d2129b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7f58e2d37c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+
+[I.12] Otherwise when FIPS is disabled, the issue is no longer reproducible. You see fewer getrandom() calls and they are non-blocking (flags not 0x02).
+
+[root@rhel9 ~]# perf record -e syscalls:sys_enter_getrandom -ag  --filter 'comm == "conmon"' --call-graph dwarf
+[root@rhel9 ~]# perf script > disabledFIPS.out
+[root@rhel9 ~]# cat disabledFIPS.out
+conmon    5553 [002]    87.207466: syscalls:sys_enter_getrandom: buf: 0x7fb39b2014d8, count: 0x00000008, flags: 0x00000001
+            7fb39b0ac7e5 ptmalloc_init.part.0+0x35 (/usr/lib64/libc.so.6)
+            7fb39b0af584 __GI___libc_malloc+0x1f4 (inlined)
+            7fb39b04e40e set_binding_values.part.0+0x1be (/usr/lib64/libc.so.6)
+            7fb39b04e6cb __bindtextdomain+0x2b (/usr/lib64/libc.so.6)
+            7fb39ad74a9a gpg_err_init+0x1a (/usr/lib64/libgpg-error.so.0.32.0)
+            7fb39b4e81ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7fb39b4e829b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7fb39b4fec19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+conmon    5566 [002]    87.257990: syscalls:sys_enter_getrandom: buf: 0x7ff84e2014d8, count: 0x00000008, flags: 0x00000001
+            7ff84e0ac7e5 ptmalloc_init.part.0+0x35 (/usr/lib64/libc.so.6)
+            7ff84e0af584 __GI___libc_malloc+0x1f4 (inlined)
+            7ff84e04e40e set_binding_values.part.0+0x1be (/usr/lib64/libc.so.6)
+            7ff84e04e6cb __bindtextdomain+0x2b (/usr/lib64/libc.so.6)
+            7ff84e217a9a gpg_err_init+0x1a (/usr/lib64/libgpg-error.so.0.32.0)
+            7ff84e5711ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7ff84e57129b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7ff84e587c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+conmon    5580 [002]    87.330885: syscalls:sys_enter_getrandom: buf: 0x7fdbe56014d8, count: 0x00000008, flags: 0x00000001
+            7fdbe54ac7e5 ptmalloc_init.part.0+0x35 (/usr/lib64/libc.so.6)
+            7fdbe54af584 __GI___libc_malloc+0x1f4 (inlined)
+            7fdbe544e40e set_binding_values.part.0+0x1be (/usr/lib64/libc.so.6)
+            7fdbe544e6cb __bindtextdomain+0x2b (/usr/lib64/libc.so.6)
+            7fdbe51aaa9a gpg_err_init+0x1a (/usr/lib64/libgpg-error.so.0.32.0)
+            7fdbe592a1ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7fdbe592a29b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7fdbe5940c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+conmon    5594 [002]    87.386345: syscalls:sys_enter_getrandom: buf: 0x7f0c162014d8, count: 0x00000008, flags: 0x00000001
+            7f0c160ac7e5 ptmalloc_init.part.0+0x35 (/usr/lib64/libc.so.6)
+            7f0c160af584 __GI___libc_malloc+0x1f4 (inlined)
+            7f0c1604e40e set_binding_values.part.0+0x1be (/usr/lib64/libc.so.6)
+            7f0c1604e6cb __bindtextdomain+0x2b (/usr/lib64/libc.so.6)
+            7f0c15daaa9a gpg_err_init+0x1a (/usr/lib64/libgpg-error.so.0.32.0)
+            7f0c1653f1ad call_init+0xbd (/usr/lib64/ld-linux-x86-64.so.2)
+            7f0c1653f29b _dl_init+0x7b (/usr/lib64/ld-linux-x86-64.so.2)
+            7f0c16555c19 _dl_start_user+0x31 (/usr/lib64/ld-linux-x86-64.so.2)
+
+ 
+Since the blocking getrandom() calls come from libgcrypt, and it's not included in RHEL 10+, this isn't to be fixed in RHEL 9. 
