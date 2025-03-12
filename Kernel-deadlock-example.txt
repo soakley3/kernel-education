@@ -1,0 +1,495 @@
+// Lucas Oakley
+// 17 January 2025
+
+Here is an example of a kernel deadlock between two CPUs, diagnosed using the 
+crash utility. The vmcore was created as a result of hard lockup conditions 
+being detected, triggering the panic and allowing kdump to save a vmcore.
+
+I diagnosed the deadlock, then was able to reproduce it intentionally writing
+a small program to allocate memory and assign it to a cgroup with a low memory
+limit in order to stimulate the OOM Killer to write to the console. Then in
+another session write continuously to /dev/console.
+
+
+
+                CPU 8                   |             CPU 39     
+------------------------------------------------------------------------------------------
+                                        |
+dump_stack_lvl()                        |
+  printk_cpu_sync_get_irqsave()         |
+    __printk_cpu_sync_try_get()         |
+      printk_cpu_sync_owner (set to 8)  |
+                                        |
+                                        |
+                                        |  uart_write()
+                                        |    uart_port_lock() 
+                                        |      struct uart_port port -> lock
+                                        |
+                                        |
+__console_emit_next_record()            |
+  serial8250_console_write()            |
+    struct uart_port port -> lock       |
+      ... waiting for CPU 39            |
+      ... to release the lock           |
+                                        |  __printk_cpu_sync_wait()
+                                        |    printk_cpu_sync_owner 
+                                        |      ... currently 8, waiting for printk_cpu_sync_owner 
+                                        |      ... to be set to -1 by CPU 8
+
+CPU 8 can't progress as it's waiting for the port->lock that is held by CPU 39.
+CPU 39 can't progress as it's waiting for printk_cpu_sync_owner to be set to -1 
+by CPU 8, which isn't progressing. 
+
+
+
+
+
+
+[INVESTIGATION]
+
+[I.1] This is the system that panic'd. 
+
+    crash> sys
+          KERNEL: testkernel1-debuginfo/usr/lib/debug/lib/modules/5.14.0-427.50.....el9_4.x86_64/vmlinux
+        DUMPFILE: /var/crash/127.0.0.1-2025-01-17-10:48:06/vmcore  [PARTIAL DUMP]
+            CPUS: 48
+            DATE: Fri Jan 17 10:47:54 EST 2025
+          UPTIME: 00:01:33
+    LOAD AVERAGE: 5.41, 1.35, 0.45
+           TASKS: 733
+        NODENAME: ...
+         RELEASE: 5.14.0-427.50.172528.el9_4.x86_64
+         VERSION: #1 SMP PREEMPT_DYNAMIC Wed Jan 15 12:33:17 EST 2025
+         MACHINE: x86_64  (2900 Mhz)
+          MEMORY: 255.5 GB
+           PANIC: "Kernel panic - not syncing: Hard LOCKUP"
+
+[I.2] The panic occurred due to hard lockup conditions being detected.
+
+    crash> log | less
+    ...
+    [   94.422076] NMI watchdog: Watchdog detected hard LOCKUP on cpu 8
+    ...
+             
+[I.3] The hard lockup was detected on CPU 8. It was vying for lock 0xffffffff9318d080.
+
+    crash> bt -c 8 
+    PID: 2348     TASK: ff46d0159f040000  CPU: 8    COMMAND: "a.out"
+     #0 [fffffe4539986a50] machine_kexec at ffffffff904782f7
+     #1 [fffffe4539986aa8] __crash_kexec at ffffffff905ef95a
+     #2 [fffffe4539986b68] panic at ffffffff9102c810
+     #3 [fffffe4539986bf0] watchdog_overflow_callback at ffffffff90632a6f
+     #4 [fffffe4539986c08] __perf_event_overflow at ffffffff90711ee2
+     #5 [fffffe4539986c38] handle_pmi_common at ffffffff90412549
+     #6 [fffffe4539986e08] intel_pmu_handle_irq at ffffffff90412f90
+     #7 [fffffe4539986e48] perf_event_nmi_handler at ffffffff90404c98
+     #8 [fffffe4539986e68] nmi_handle at ffffffff9043005b
+     #9 [fffffe4539986eb0] default_do_nmi at ffffffff91083fc0
+    #10 [fffffe4539986ed0] exc_nmi at ffffffff910841bf
+    #11 [fffffe4539986ef0] end_repeat_nmi at ffffffff912016e9
+        [exception RIP: native_queued_spin_lock_slowpath+0x72]
+        RIP: ffffffff91098eb2  RSP: ff6803f24f027818  RFLAGS: 00000002
+        RAX: 0000000000000001  RBX: ff6803f24f0279bf  RCX: 0000000000000000
+        RDX: 0000000000000000  RSI: 0000000000000000  RDI: ffffffff9318d080
+        RBP: ffffffff9318d080   R8: 30613678302f3462   R9: 3178302b746c7561
+        R10: 61665f726464615f  R11: 726573755f6f6420  R12: 0000000000000046
+        R13: ffffffff92ea8b40  R14: ffffffff92ea8b40  R15: ffffffff9318d080
+        ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0000
+    --- <NMI exception stack> ---
+    #12 [ff6803f24f027818] native_queued_spin_lock_slowpath at ffffffff91098eb2
+    #13 [ff6803f24f027838] _raw_spin_lock_irqsave at ffffffff91098640
+    #14 [ff6803f24f027848] serial8250_console_write at ffffffff90bba199
+    #15 [ff6803f24f0278d8] __console_emit_next_record at ffffffff905913b2
+    #16 [ff6803f24f0279a8] console_unlock at ffffffff905919d3
+    #17 [ff6803f24f0279f8] vprintk_emit at ffffffff905931e8
+    #18 [ff6803f24f027a40] _printk at ffffffff91032d79
+    #19 [ff6803f24f027aa0] show_trace_log_lvl at ffffffff91025709
+    #20 [ff6803f24f027b98] dump_stack_lvl at ffffffff9104b023
+    #21 [ff6803f24f027bb0] dump_header at ffffffff9103a31e
+    #22 [ff6803f24f027bd0] oom_kill_process.cold at ffffffff9103a515
+    #23 [ff6803f24f027bf8] out_of_memory at ffffffff907374ad
+    #24 [ff6803f24f027c30] mem_cgroup_out_of_memory at ffffffff90802b31
+    #25 [ff6803f24f027ca8] try_charge_memcg at ffffffff90808083
+    #26 [ff6803f24f027d48] charge_memcg at ffffffff90808982
+    #27 [ff6803f24f027d68] __mem_cgroup_charge at ffffffff9080a2e9
+    #28 [ff6803f24f027d88] do_anonymous_page at ffffffff9077ca05
+    #29 [ff6803f24f027dc0] __handle_mm_fault at ffffffff90784b5b
+    #30 [ff6803f24f027ea0] handle_mm_fault at ffffffff90784f7d
+    #31 [ff6803f24f027ed8] do_user_addr_fault at ffffffff9048ade4
+    #32 [ff6803f24f027f28] exc_page_fault at ffffffff91086aa2
+    #33 [ff6803f24f027f50] asm_exc_page_fault at ffffffff91200c12
+        RIP: 00007f9463990eba  RSP: 00007fffba49b518  RFLAGS: 00010206
+        RAX: 0000000000000000  RBX: 0000000000000000  RCX: 00000000000bd010
+        RDX: 00007f9417441010  RSI: 0000000000000000  RDI: 00007f9417484000
+        RBP: 00007fffba49b530   R8: 00007f9417441010   R9: 0000000000000000
+        R10: 0000000000000022  R11: 0000000000000246  R12: 00007fffba49b648
+        R13: 0000000000401156  R14: 0000000000403e08  R15: 00007f9463b4e000
+        ORIG_RAX: ffffffffffffffff  CS: 0033  SS: 002b
+
+[I.4] This lock is the lock in a `uart_port` structure, copied from R15 to RDI before calling _raw_spin_lock_irqsave().
+      Per x86 convention, we know that the first parameter of a routine is copied to RDI before calling the subsequent routine.
+
+    crash> dis -rl ffffffff90bba199 | tail 
+    ...
+    /usr/src/debug/kernel-5.14.0-427.50.172528.el9_4/linux-5.14.0-427.50.172528.el9_4.x86_64/drivers/tty/serial/8250/8250_port.c: 3449
+    0xffffffff90bba191 <serial8250_console_write+0x71>:	mov    %r15,%rdi
+    0xffffffff90bba194 <serial8250_console_write+0x74>:	call   0xffffffff91098610 <_raw_spin_lock_irqsave>
+    0xffffffff90bba199 <serial8250_console_write+0x79>:	mov    %rax,0x18(%rsp)
+
+    3435 void serial8250_console_write(struct uart_8250_port *up, const char *s,
+    3436                               unsigned int count)
+    3437 {
+    3438         struct uart_8250_em485 *em485 = up->em485;
+    3439         struct uart_port *port = &up->port;
+    3440         unsigned long flags;
+    3441         unsigned int ier, use_fifo;
+    3442         int locked = 1;
+    3443 
+    3444         touch_nmi_watchdog();
+    3445 
+    3446         if (oops_in_progress)
+    3447                 locked = spin_trylock_irqsave(&port->lock, flags);
+    3448         else
+    3449                 spin_lock_irqsave(&port->lock, flags);                  <<<<<
+
+[I.5] Since R15 and RDI aren't modified before the panic, we can find their values from the bt in [I.3]
+
+    crash> dis -rl ffffffff91098640 | grep "r15\|rdi"
+    0xffffffff91098629 <_raw_spin_lock_irqsave+0x19>:	lock cmpxchg %edx,(%rdi)
+     
+    crash> dis -rl ffffffff91098eb2 | grep "r15\|rdi"
+    0xffffffff91098e4a <native_queued_spin_lock_slowpath+0xa>:	mov    %rdi,%rbp
+
+    RDI: ffffffff9318d080
+    R15: ffffffff9318d080
+
+[I.6] Since the lock is at offset 0x0 of the uart_8250_port structure and the uart_port structures, we know the lock is 0xffffffff9318d080.
+
+    crash> struct uart_8250_port.port -o 
+    struct uart_8250_port {
+        [0x0] struct uart_port port;
+    }
+
+    crash> struct uart_port.lock -o 
+    struct uart_port {
+        [0x0] spinlock_t lock;
+    }
+
+[I.7] It's current held.
+
+    crash> px ((struct uart_8250_port *)0xffffffff9318d080)->port->lock 
+    $1 = {
+      {
+        rlock = {
+          raw_lock = {
+            {
+              val = {
+                counter = 0x101
+              },
+              {
+                locked = 0x1,
+                pending = 0x1
+              },
+              {
+                locked_pending = 0x101,
+                tail = 0x0
+              }
+            }
+          }
+        }
+      }
+    }
+
+[I.8] I suspect that CPU 39 holds it based on the call stack. We'll need to prove this with a code review.
+
+    crash> bt -c 39
+    PID: 2252     TASK: ff46cff1689e2380  CPU: 39   COMMAND: "bash"
+     #0 [fffffe1ffe759e60] crash_nmi_callback at ffffffff90469461
+     #1 [fffffe1ffe759e68] nmi_handle at ffffffff9043005b
+     #2 [fffffe1ffe759eb0] default_do_nmi at ffffffff91083fc0
+     #3 [fffffe1ffe759ed0] exc_nmi at ffffffff910841bf
+     #4 [fffffe1ffe759ef0] end_repeat_nmi at ffffffff912016e9
+        [exception RIP: __printk_cpu_sync_wait+0x7]
+        RIP: ffffffff9058ed97  RSP: ff6803f24e8bfbc0  RFLAGS: 00000017
+        RAX: 0000000000000008  RBX: 0000000000000046  RCX: 0000000000000000
+        RDX: 0000000000000027  RSI: ff46d010b1e400cb  RDI: ffffffff9318d080
+        RBP: ffffffff9318d080   R8: 0000000000000000   R9: 000000000000072e
+        R10: 0000000000000001  R11: 0000000000000000  R12: 0000000000000007
+        R13: 0000000000000000  R14: ff46cff161300000  R15: 0000000000000000
+        ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+    --- <NMI exception stack> ---
+     #5 [ff6803f24e8bfbc0] __printk_cpu_sync_wait at ffffffff9058ed97
+     #6 [ff6803f24e8bfbc0] serial8250_start_tx at ffffffff90bb9d3c
+     #7 [ff6803f24e8bfbe0] uart_write at ffffffff90bb2381
+     #8 [ff6803f24e8bfc30] process_output_block at ffffffff90b8ee37
+     #9 [ff6803f24e8bfc70] n_tty_write at ffffffff90b8fff2
+    #10 [ff6803f24e8bfcf8] do_tty_write at ffffffff90b8b4f4
+    #11 [ff6803f24e8bfd60] file_tty_write.constprop.0 at ffffffff90b8b6bd
+    #12 [ff6803f24e8bfd90] vfs_write at ffffffff90832cdb
+    #13 [ff6803f24e8bfe20] ksys_write at ffffffff9083316f
+    #14 [ff6803f24e8bfe58] do_syscall_64 at ffffffff91082459
+    #15 [ff6803f24e8bff50] entry_SYSCALL_64_after_hwframe at ffffffff9120012f
+        RIP: 00007fc4696fda57  RSP: 00007fffba854be8  RFLAGS: 00000246
+        RAX: ffffffffffffffda  RBX: 00000000000000cc  RCX: 00007fc4696fda57
+        RDX: 00000000000000cc  RSI: 000055b6dc3c81f0  RDI: 0000000000000001
+        RBP: 000055b6dc3c81f0   R8: 0000000000000000   R9: 00007fc4697b14e0
+        R10: 00007fc4697b13e0  R11: 0000000000000246  R12: 00000000000000cc
+        R13: 00007fc4697fb780  R14: 00000000000000cc  R15: 00007fc4697f69e0
+        ORIG_RAX: 0000000000000001  CS: 0033  SS: 002b
+
+[I.9] It looks like a lock is taken in uart_write(), line 577 in [I.11]. Let's confirm if its the same one. 
+
+     559 static int uart_write(struct tty_struct *tty,
+     560                                         const unsigned char *buf, int count)
+     561 {
+     562         struct uart_state *state = tty->driver_data;
+
+[I.10] The tty_struct is in RDI at the start of the function call. We read it at offset 0x258 to derive the driver_data pointer
+       and place the address in R14 for the struct uart_state `state`. 
+
+    crash> struct tty_struct.driver_data -o 
+    struct tty_struct {
+      [0x258] void *driver_data;
+    }
+
+    /usr/src/debug/kernel-5.14.0-427.50.172528.el9_4/linux-5.14.0-427.50.172528.el9_4.x86_64/drivers/tty/serial/serial_core.c: 562
+    0xffffffff90bb2293 <uart_write+0x13>:   mov    0x258(%rdi),%r14
+
+    crash> dis -rl ffffffff90bb9d3c | grep r14
+    crash> dis -rl ffffffff9058ed97 | grep r14
+
+    R14: ff46cff161300000
+
+     563         struct uart_port *port;
+     564         struct circ_buf *circ;
+     565         unsigned long flags;
+     566         int c, ret = 0;
+     567 
+     568         /*
+     569          * This means you called this function _after_ the port was
+     570          * closed.  No cookie for you.
+     571          */
+     572         if (!state) {
+     573                 WARN_ON(1);
+     574                 return -EL3HLT;
+     575         }
+     576 
+
+[I.11] The `state` is then passed into uart_port_lock() and a lock taken. 
+
+     577         port = uart_port_lock(state, flags);                             <<<<<<<<<<<<<<<<<<<
+
+          71 #define uart_port_lock(state, flags)                                    \
+          72         ({                                                              \
+          73                 struct uart_port *__uport = uart_port_ref(state);       \
+          74                 if (__uport)                                            \
+          75                         spin_lock_irqsave(&__uport->lock, flags);       \
+          76                 __uport;                                                \
+          77         })
+
+[I.12] Since R14 isn't modified before the panic, we see that it held address 0xff46cff161300000, the uart_state struct.
+       From this we can derive the lock address and can confirm that it has taken the lock. 
+
+              58 static inline struct uart_port *uart_port_ref(struct uart_state *state)
+              59 {
+              60         if (atomic_add_unless(&state->refcount, 1, 0))
+
+                crash> struct uart_state.refcount ff46cff161300000
+                  refcount = {
+                    counter = 0x2
+                  },
+
+              61                 return state->uart_port;
+
+                crash> px &((struct uart_state *)0xff46cff161300000)->uart_port->lock
+                $4 = (spinlock_t *) 0xffffffff9318d080 <serial8250_ports>
+
+
+              62         return NULL;
+              63 }
+
+
+     578         circ = &state->xmit;
+     579         if (!circ->buf) {
+     580                 uart_port_unlock(port, flags);
+     581                 return 0;
+     582         }
+     583 
+     584         while (port) {
+     585                 c = CIRC_SPACE_TO_END(circ->head, circ->tail, UART_XMIT_SIZE);
+     586                 if (count < c)
+     587                         c = count;
+     588                 if (c <= 0)
+     589                         break;
+     590                 memcpy(circ->buf + circ->head, buf, c);
+     591                 circ->head = (circ->head + c) & (UART_XMIT_SIZE - 1);
+     592                 buf += c;
+     593                 count -= c;
+     594                 ret += c;
+     595         }
+     596 
+
+[I.13] We then continue executing up the stack and haven't unlocked the lock yet. 
+
+     597         __uart_start(tty);
+
+         121 static void __uart_start(struct tty_struct *tty)
+         122 {
+         123         struct uart_state *state = tty->driver_data;
+         124         struct uart_port *port = state->uart_port;
+         125 
+         126         if (port && !uart_tx_stopped(port))
+         127                 port->ops->start_tx(port);            <<<<<< call this function pointer.
+
+
+     598         uart_port_unlock(port, flags);                    <<<<<<< so we havent made it here yet 
+     599         return ret;
+     600 }
+
+
+[I.14] CPU 39 is waiting for printk_cpu_sync_owner to be -1, but it's set to 8, showing the CPU that current holds it. 
+
+    crash> bt -c 39
+    PID: 2252     TASK: ff46cff1689e2380  CPU: 39   COMMAND: "bash"
+     #0 [fffffe1ffe759e60] crash_nmi_callback at ffffffff90469461
+     #1 [fffffe1ffe759e68] nmi_handle at ffffffff9043005b
+     #2 [fffffe1ffe759eb0] default_do_nmi at ffffffff91083fc0
+     #3 [fffffe1ffe759ed0] exc_nmi at ffffffff910841bf
+     #4 [fffffe1ffe759ef0] end_repeat_nmi at ffffffff912016e9
+        [exception RIP: __printk_cpu_sync_wait+0x7]
+        RIP: ffffffff9058ed97  RSP: ff6803f24e8bfbc0  RFLAGS: 00000017
+        RAX: 0000000000000008  RBX: 0000000000000046  RCX: 0000000000000000
+        RDX: 0000000000000027  RSI: ff46d010b1e400cb  RDI: ffffffff9318d080
+        RBP: ffffffff9318d080   R8: 0000000000000000   R9: 000000000000072e
+        R10: 0000000000000001  R11: 0000000000000000  R12: 0000000000000007
+        R13: 0000000000000000  R14: ff46cff161300000  R15: 0000000000000000
+        ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+    --- <NMI exception stack> ---
+     #5 [ff6803f24e8bfbc0] __printk_cpu_sync_wait at ffffffff9058ed97
+     #6 [ff6803f24e8bfbc0] serial8250_start_tx at ffffffff90bb9d3c
+
+
+    4595 void __printk_cpu_sync_wait(void)
+    4596 {
+    4597         do {
+    4598                 cpu_relax();
+    4599         } while (atomic_read(&printk_cpu_sync_owner) != -1);
+    4600 }
+
+    crash> pd printk_cpu_sync_owner
+    printk_cpu_sync_owner = $6 = {
+      counter = 8
+    }
+
+[I.15] And CPU 8 set printk_cpu_sync_owner to 8 from dump_stack_lvl() before continuing up the stack
+       and spinning waiting for the port->lock.
+
+    crash> bt -c 8 
+    PID: 2348     TASK: ff46d0159f040000  CPU: 8    COMMAND: "a.out"
+     #0 [fffffe4539986a50] machine_kexec at ffffffff904782f7
+     #1 [fffffe4539986aa8] __crash_kexec at ffffffff905ef95a
+     #2 [fffffe4539986b68] panic at ffffffff9102c810
+     #3 [fffffe4539986bf0] watchdog_overflow_callback at ffffffff90632a6f
+     #4 [fffffe4539986c08] __perf_event_overflow at ffffffff90711ee2
+     #5 [fffffe4539986c38] handle_pmi_common at ffffffff90412549
+     #6 [fffffe4539986e08] intel_pmu_handle_irq at ffffffff90412f90
+     #7 [fffffe4539986e48] perf_event_nmi_handler at ffffffff90404c98
+     #8 [fffffe4539986e68] nmi_handle at ffffffff9043005b
+     #9 [fffffe4539986eb0] default_do_nmi at ffffffff91083fc0
+    #10 [fffffe4539986ed0] exc_nmi at ffffffff910841bf
+    #11 [fffffe4539986ef0] end_repeat_nmi at ffffffff912016e9
+        [exception RIP: native_queued_spin_lock_slowpath+0x72]
+        RIP: ffffffff91098eb2  RSP: ff6803f24f027818  RFLAGS: 00000002
+        RAX: 0000000000000001  RBX: ff6803f24f0279bf  RCX: 0000000000000000
+        RDX: 0000000000000000  RSI: 0000000000000000  RDI: ffffffff9318d080
+        RBP: ffffffff9318d080   R8: 30613678302f3462   R9: 3178302b746c7561
+        R10: 61665f726464615f  R11: 726573755f6f6420  R12: 0000000000000046
+        R13: ffffffff92ea8b40  R14: ffffffff92ea8b40  R15: ffffffff9318d080
+        ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0000
+    --- <NMI exception stack> ---
+    #12 [ff6803f24f027818] native_queued_spin_lock_slowpath at ffffffff91098eb2
+    #13 [ff6803f24f027838] _raw_spin_lock_irqsave at ffffffff91098640
+    #14 [ff6803f24f027848] serial8250_console_write at ffffffff90bba199
+    #15 [ff6803f24f0278d8] __console_emit_next_record at ffffffff905913b2
+    #16 [ff6803f24f0279a8] console_unlock at ffffffff905919d3
+    #17 [ff6803f24f0279f8] vprintk_emit at ffffffff905931e8
+    #18 [ff6803f24f027a40] _printk at ffffffff91032d79
+    #19 [ff6803f24f027aa0] show_trace_log_lvl at ffffffff91025709
+    #20 [ff6803f24f027b98] dump_stack_lvl at ffffffff9104b023
+    #21 [ff6803f24f027bb0] dump_header at ffffffff9103a31e
+    #22 [ff6803f24f027bd0] oom_kill_process.cold at ffffffff9103a515
+    #23 [ff6803f24f027bf8] out_of_memory at ffffffff907374ad
+    #24 [ff6803f24f027c30] mem_cgroup_out_of_memory at ffffffff90802b31
+    #25 [ff6803f24f027ca8] try_charge_memcg at ffffffff90808083
+    #26 [ff6803f24f027d48] charge_memcg at ffffffff90808982
+    #27 [ff6803f24f027d68] __mem_cgroup_charge at ffffffff9080a2e9
+    #28 [ff6803f24f027d88] do_anonymous_page at ffffffff9077ca05
+    #29 [ff6803f24f027dc0] __handle_mm_fault at ffffffff90784b5b
+    #30 [ff6803f24f027ea0] handle_mm_fault at ffffffff90784f7d
+    #31 [ff6803f24f027ed8] do_user_addr_fault at ffffffff9048ade4
+    #32 [ff6803f24f027f28] exc_page_fault at ffffffff91086aa2
+    #33 [ff6803f24f027f50] asm_exc_page_fault at ffffffff91200c12
+        RIP: 00007f9463990eba  RSP: 00007fffba49b518  RFLAGS: 00010206
+        RAX: 0000000000000000  RBX: 0000000000000000  RCX: 00000000000bd010
+        RDX: 00007f9417441010  RSI: 0000000000000000  RDI: 00007f9417484000
+        RBP: 00007fffba49b530   R8: 00007f9417441010   R9: 0000000000000000
+        R10: 0000000000000022  R11: 0000000000000246  R12: 00007fffba49b648
+        R13: 0000000000401156  R14: 0000000000403e08  R15: 00007f9463b4e000
+        ORIG_RAX: ffffffffffffffff  CS: 0033  SS: 002b
+
+
+
+     97 asmlinkage __visible void dump_stack_lvl(const char *log_lvl)
+     98 {
+     99         unsigned long flags;
+    100 
+    101         /*
+    102          * Permit this cpu to perform nested stack dumps while serialising
+    103          * against other CPUs
+    104          */
+    105         printk_cpu_sync_get_irqsave(flags);
+
+        332 #define printk_cpu_sync_get_irqsave(flags)              \
+        333         for (;;) {                                      \
+        334                 local_irq_save(flags);                  \
+        335                 if (__printk_cpu_sync_try_get())        \
+
+            4614 int __printk_cpu_sync_try_get(void)
+            4615 {
+            4616         int cpu;
+            4617         int old;
+            4618 
+            4619         cpu = smp_processor_id();
+            ....
+            4640         old = atomic_cmpxchg_acquire(&printk_cpu_sync_owner, -1,
+            4641                                      cpu); /* LMM(__printk_cpu_sync_try_get:A) */     <<<< printk_cpu_sync_owner set to CPU 8 here
+            4642         if (old == -1) {                                                              <<<< enter here since old is now -1.
+            4643                 /*
+            4644                  * This CPU is now the owner and begins loading/storing
+            4645                  * data: LMM(__printk_cpu_sync_try_get:B)
+            4646                  */
+            4647                 return 1;                                                             <<<< return 1  here
+            4648 
+            4649         } else if (old == cpu) {
+            4650                 /* This CPU is already the owner. */
+            4651                 atomic_inc(&printk_cpu_sync_nested);
+            4652                 return 1;
+            4653         }
+            4654 
+            4655         return 0;
+            4656 }
+
+
+        336                         break;                          \                                  <<<< do the break 
+        337                 local_irq_restore(flags);               \
+        338                 __printk_cpu_sync_wait();               \
+        339         }
+
+
+    106         __dump_stack(log_lvl);                                                                 <<<< continue executing up the stack
+
+
+         85 static void __dump_stack(const char *log_lvl)
+         86 {
+         87         dump_stack_print_info(log_lvl);
+         88         show_stack(NULL, NULL, log_lvl);                                                  <<<< on to the next call up the stack
