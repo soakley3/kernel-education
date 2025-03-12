@@ -9,6 +9,8 @@ Lucas Oakley (stlucas)
 
 RHEL 9.5 slub debug user tracking, and other some other details.
 How to use the U in slub_debug=FZPU to determine the root cause of Use-After-Free slab corruption.
+This differs from RHEL 9.0-9.4. At the bottom of this example is the root cause of diagnosing
+a Use-After-Free using the User tracking information.
  
 
 [INVESTIGATION]
@@ -616,6 +618,14 @@ How to use the U in slub_debug=FZPU to determine the root cause of Use-After-Fre
 
 [SUMMARY]
 
+    The panic occurs on CPU 8 because it races to a cached_fid structure
+that was freed by CPU 17 just before the panic. It looks like allocating
+the cached_fid object and then placing it on it's parent's cached_fids->entries
+list requires holding the parent structure cached_fids' fid_list_lock lock, 
+but then freeing the cached_fid object doesn't require the lock. CPU 8 however 
+is accessing the cached_fids->entries list, and takes the lock, but the cached
+fid object on the list was freed immediately before by CPU 17. 
+
 Looks like a race when freeing a slab object without holding a lock, leading to a Use-After-Free: 
 
         CPU 17                                               CPU 8 
@@ -633,20 +643,32 @@ lock in the following path:                      |
         init_cached_dir() (takes and releases    |
                    cfids->cfid_list_lock lock)   |
                                                  |
+- - - - - - - - - - - - - - - - - - - - - - - - -|- - - - - - - - - - - - - - - - - - - - - - - - -
                                                  |
+PID 1160579 then frees the cached_fid            |  
+object without taking the                        |  
+cfids->cfid_list_lock lock in the                |  
+following path:                                  |  
                                                  |
-PID 1160579 then frees the cached_fid            |  PID 1160274 calls open_cached_dir_by_dentry() 
-object without taking the                        |  and takes the cfids->cfid_list_lock lock. Then
-cfids->cfid_list_lock lock in the                |  tries to iterate the cfids->entries list
-following path:                                  |  but trips over the race like this:
+    cifs_readdir()                               |
+      open_cached_dir()                          |
+        free_cached_dir()                        |
                                                  |
-    cifs_readdir()                               |   lookup_fast()
-      open_cached_dir()                          |     cifs_d_revalidate()
-        free_cached_dir()                        |       cifs_revalidate_dentry()
+- - - - - - - - - - - - - - - - - - - - - - - - -|- - - - - - - - - - - - - - - - - - - - - - - - -
+                                                 |  Just 1 jiffy after PID 1160579 on CPU 17 frees the object,
+                                                 |  PID 1160274 on CPU 8 calls open_cached_dir_by_dentry() 
+                                                 |  and takes the cfids->cfid_list_lock lock. Then
+                                                 |  tries to iterate the cfids->entries list
+                                                 |  but trips over the race like this, finding the free'd 
+                                                 |  object still on the list.
+                                                 |
+                                                 |   lookup_fast()
+                                                 |     cifs_d_revalidate()
+                                                 |       cifs_revalidate_dentry()
                                                  |         cifs_revalidate_dentry_attr()
                                                  |           cifs_dentry_needs_reval()
                                                  |             open_cached_dir_by_dentry() (takes cfids->cfid_list_lock lock, then panic)
-
+                                                 |
 
 Which is fixed with this: 
 
