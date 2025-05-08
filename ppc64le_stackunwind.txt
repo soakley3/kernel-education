@@ -124,10 +124,10 @@ This is the function prologue for nfs_do_access(). This is how the stack is buil
 Notice that we copy the contents of R30 and R28 directly to the stack frame we're building.
 
     crash> dis -rl d000000009358398 | head -n 20
-    0xd000000009358328 <nfs_do_access>:	addis   r2,r12,6               << Not executed since we branch to nfs_do_access+0x8
-    0xd00000000935832c <nfs_do_access+0x4>:	addi    r2,r2,-15144       << Not executed since we branch to nfs_do_access+0x8
-    0xd000000009358330 <nfs_do_access+0x8>:	mflr    r0                 << Save LR register contents to R0 
-    0xd000000009358334 <nfs_do_access+0xc>:	nop                        << No-op (potential hook for ftrace).
+    0xd000000009358328 <nfs_do_access>:	addis   r2,r12,6             << Not executed since we branch to nfs_do_access+0x8
+    0xd00000000935832c <nfs_do_access+0x4>:	addi    r2,r2,-15144   << Not executed since we branch to nfs_do_access+0x8
+    0xd000000009358330 <nfs_do_access+0x8>:	mflr    r0             << Save LR register contents to R0 
+    0xd000000009358334 <nfs_do_access+0xc>:	nop                    << No-op (potential hook for ftrace).
     0xd000000009358338 <nfs_do_access+0x10>:	mflr    r0             << Save LR register contents to R0 (Think of this similarly to Return Instruction Pointer) 
     0xd00000000935833c <nfs_do_access+0x14>:	std     r26,-48(r1)    \
     0xd000000009358340 <nfs_do_access+0x18>:	std     r27,-40(r1)    | save contents of R26, R27, R28, R29, R30 to the stack
@@ -135,7 +135,7 @@ Notice that we copy the contents of R30 and R28 directly to the stack frame we'r
     0xd000000009358348 <nfs_do_access+0x20>:	std     r29,-24(r1)    |
     0xd00000000935834c <nfs_do_access+0x24>:	std     r30,-16(r1)    /
     0xd000000009358350 <nfs_do_access+0x28>:	std     r0,16(r1)      << save the LR address in R0 to the prior function's frame. 
-    0xd000000009358354 <nfs_do_access+0x2c>:	stdu    r1,-176(r1)    << save the old stack pointer (R1: c00000012f703a70) to the top of the new frame we're creating
+    0xd000000009358354 <nfs_do_access+0x2c>:	stdu    r1,-176(r1)    << save the old stack pointer (R1: c00000012f703a70) to the top of the new frame we're creating, grow stack by 176 bytes
     0xd000000009358358 <nfs_do_access+0x30>:	ld      r9,3192(r13)   << Derive the stack canary from the paca_struct and place it in R9
     0xd00000000935835c <nfs_do_access+0x34>:	std     r9,120(r1)     << Place the canary value in R9 on the stack. 
     0xd000000009358360 <nfs_do_access+0x38>:	li      r9,0           << NULL out R9 
