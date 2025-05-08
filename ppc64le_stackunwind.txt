@@ -7,7 +7,7 @@ Lucas Oakley (stlucas)
 This is a brief example of how to do a stack unwind on ppc64le.
 It has a brief annotation of the assembly and a stack frame. 
 
-This assumes so x86 background knowledge.
+This assumes some x86 background knowledge.
 
 
 
